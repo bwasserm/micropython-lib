@@ -115,10 +115,47 @@ _MTP_RESP_INVALID_OPERATION = const(0x2002)
 _MTP_INVALID_STORAGE_ID = const(0x2008)
 
 # Operation codes
+# Appendix D, Table D.1
 _MTP_OP_GET_DEVICE_INFO = 0x1001
 _MTP_OP_OPEN_SESSION = 0x1002
 _MTP_OP_GET_STORAGE_IDS = 0x1004
-_MTP_GET_STORAGE_INFO = 0x1005
+_MTP_OP_GET_STORAGE_INFO = 0x1005
+_MTP_OP_GET_NUM_OBJECTS = 0x1006
+_MTP_OP_GET_OBJECT_HANDLES = 0x1007
+_MTP_OP_GET_OBJECT_INFO = 0x1008
+_MTP_OP_GET_OBJECT = 0x1009
+_MTP_OP_SEND_OBJECT_INFO = 0x100C
+_MTP_OP_SEND_OBJECT = 0x100D
+_MTP_OP_RESET_DEVICE = 0x1010
+_MTP_OP_MOVE_OBJECT = 0x1019
+_MTP_OP_COPY_OBJECT = 0x101A
+
+# Event codes
+# Appendix G, Table G.1
+_MTP_EVENT_UNDEFINED = 0x4000
+# _MTP_EVENT_CANCEL_TRANSACTION = 0x4001  # Don't know how to support this yet
+_MTP_EVENT_OBJECT_ADDED = 0x4002
+_MTP_EVENT_OBJECT_REMOVED = 0x4003
+
+# Device Property codes
+# Apendix C, Table C.1
+_MTP_DEVICE_PROP_UNDEFINED = 0x5000
+
+STORAGE_ID = 0x00010001
+
+# Supported formats
+_MTP_SUPPORTED_OBJECT_FORMATS = [
+    # Appendix A. Table A.1
+    0x3000,  # unidentified
+    0x3001,  # association (folder)
+    0x3002,  # script
+    0x3004,  # text
+    0x3800,  # undefined image
+    0x3801,  # JPEG
+    0x3804,  # BMP
+    0x3807,  # GIF
+    0x380B,  # PNG
+]
 
 
 class MTPInterface(Interface):
@@ -290,7 +327,7 @@ class MTPHandler:
 
     def __init__(self):
         self.session_id = None
-        self.storage_ids = []
+        self.object_handles = []
 
     def handle_command(self, container):
         """
@@ -309,32 +346,47 @@ class MTPHandler:
             return self._handle_open_session(txn_id, payload)
         elif code == _MTP_OP_GET_STORAGE_IDS:
             return self._handle_get_storage_ids(txn_id)
-        elif code == _MTP_GET_STORAGE_INFO:
+        elif code == _MTP_OP_GET_STORAGE_INFO:
             return self._handle_get_storage_info(txn_id, payload)
+        # _MTP_OP_GET_NUM_OBJECTS
+        # _MTP_OP_GET_OBJECT_HANDLES
+        # _MTP_OP_GET_OBJECT_INFO
+        # _MTP_OP_GET_OBJECT
+        # _MTP_OP_SEND_OBJECT_INFO
+        # _MTP_OP_SEND_OBJECT
+        # _MTP_OP_RESET_DEVICE
+        # _MTP_OP_MOVE_OBJECT
+        # _MTP_OP_COPY_OBJECT
         else:
             # Unknown operation
             return self._build_response(code, _MTP_RESP_INVALID_OPERATION, txn_id), None
 
-    def _build_response(self, code, resp_code, txn_id, params=None):
+    def _build_response(self, code, resp_code, txn_id, params=None, data=None):
         """Build MTP response container."""
         payload = b""
         if params:
             payload = struct.pack("<" + "I" * len(params), *params)
 
-        length = 12 + len(payload)
-        header = struct.pack(
-            "<IHHI", length, _MTP_CONTAINER_TYPE_RESPONSE, resp_code, txn_id
-        )
-        return header + payload
+        data = data or b""
+        length = 12 + len(payload) + len(data)
+        if data:
+            container_type = _MTP_CONTAINER_TYPE_DATA
+            container_code = code
+        else:
+            container_type = _MTP_CONTAINER_TYPE_RESPONSE
+            container_code = resp_code
+        header = struct.pack("<IHHI", length, container_type, container_code, txn_id)
+
+        return header + payload + data
 
     def _encode_string(self, string: str):
         # Max len (including null terminator) is 255
         if len(string) > 254:
             string = string[:255]
-        num_chars = struct.pack("<B", len(string))
+        num_chars = struct.pack("<B", len(string) + (1 if len(string) > 0 else 0))
         encoded = num_chars
         for c in string:
-            encoded += c.encode() + b"\0"
+            encoded += (c.encode() + b"\0")[:2]
         if len(string) > 0:
             encoded += b"\0\0"
         return encoded
@@ -352,7 +404,9 @@ class MTPHandler:
         device_info_dataset = b""
         standard_version = struct.pack("<H", 100)  # 1.00
         mtp_vendor_extension_id = struct.pack("<I", 0xFFFFFFFF)
-        mtp_version = struct.pack("<H", 0x000B)  # Arbitrary. Phone uses 0x0064
+        mtp_version = struct.pack(
+            "<H", 110
+        )  # In hundreths. PDF is v1.1. Phone uses 0x0064
         mtp_extensions = self._encode_string("")  # TODO: Fill in
         functional_mode = struct.pack("<H", 0x0000)  # Standard mode
         operations_supported = self._encode_array(
@@ -362,31 +416,41 @@ class MTPHandler:
                 _MTP_OP_GET_DEVICE_INFO,
                 _MTP_OP_OPEN_SESSION,
                 _MTP_OP_GET_STORAGE_IDS,
-                _MTP_GET_STORAGE_INFO,
+                _MTP_OP_GET_STORAGE_INFO,
+                _MTP_OP_GET_NUM_OBJECTS,
+                _MTP_OP_GET_OBJECT_HANDLES,
+                _MTP_OP_GET_OBJECT_INFO,
+                _MTP_OP_GET_OBJECT,
+                _MTP_OP_SEND_OBJECT_INFO,
+                _MTP_OP_SEND_OBJECT,
+                _MTP_OP_RESET_DEVICE,
+                _MTP_OP_MOVE_OBJECT,
+                _MTP_OP_COPY_OBJECT,
             ],
         )
-        events_supported = self._encode_array("H", [])  # TODO: fill in array
-        device_properties_supported = self._encode_array("", [])  # TODO: fill in array
-        capture_formats = self._encode_array("H", [])  # TODO: fill in array
-        playback_formats = self._encode_array(
+        events_supported = self._encode_array(
             "H",
             [
-                # Appendix A. Table A.1
-                0x3000,  # unidentified
-                0x3001,  # association (folder)
-                0x3002,  # script
-                0x3004,  # text
-                0x3800,  # undefined image
-                0x3801,  # JPEG
-                0x3804,  # BMP
-                0x3807,  # GIF
-                0x380B,  # PNG
+                _MTP_EVENT_UNDEFINED,
+                _MTP_EVENT_OBJECT_ADDED,
+                _MTP_EVENT_OBJECT_REMOVED,
             ],
-        )  # 0x3000 is unidentified, TODO: fill in array
+        )
+        device_properties_supported = self._encode_array(
+            "H", [_MTP_DEVICE_PROP_UNDEFINED]
+        )
+        capture_formats = self._encode_array("H", _MTP_SUPPORTED_OBJECT_FORMATS)
+        playback_formats = self._encode_array(
+            "H",
+            _MTP_SUPPORTED_OBJECT_FORMATS,
+        )
         manufacturer = self._encode_string("HackADay")
-        model = self._encode_string("SuperconBadge0x0A")
-        device_version = self._encode_string("1")
-        serial_number = self._encode_string("0" * 32)  # must be 32-char hex string
+        model = self._encode_string("SuperconBadge")
+        device_version = self._encode_string("0x0A")
+        base_id = "".join([hex(b)[2:4].upper() for b in machine.unique_id()])
+        serial_number = self._encode_string(
+            "0" * (32 - len(base_id)) + base_id
+        )  # must be 32-char hex string
         device_info_dataset = device_info_dataset + (
             standard_version
             + mtp_vendor_extension_id
@@ -403,8 +467,10 @@ class MTPHandler:
             + device_version
             + serial_number
         )
-        response = self._build_response(_MTP_OP_GET_DEVICE_INFO, _MTP_RESP_OK, txn_id)
-        return response, device_info_dataset
+        response = self._build_response(
+            _MTP_OP_GET_DEVICE_INFO, _MTP_RESP_OK, txn_id, data=device_info_dataset
+        )
+        return response, None
 
     def _handle_open_session(self, txn_id, payload):
         """Initialize session."""
@@ -417,24 +483,17 @@ class MTPHandler:
     def _handle_get_storage_ids(self, txn_id):
         """Return storage IDs."""
         # 5.2.1 Storage IDs
-        self._scan_fs("/")
-
-        storage_ids = struct.pack("<I", len(self.storage_ids) - 1)
-        for idx in range(1, len(self.storage_ids)):
-            # First 16 bits are the "physical storage", which can't be 0.
-            # Last 16 bits is the "logical storage", which also can't be 0.
-            storage_ids.append(struct.pack("<I", 0x00010000 + idx))
-
+        storage_ids = self._encode_array("I", [STORAGE_ID])
         response = self._build_response_container(
-            _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_OK, txn_id
+            _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_OK, txn_id, data=storage_ids
         )
 
-        return response, storage_ids
+        return response, None
 
     def _handle_get_storage_info(self, txn_id, payload):
         if len(payload) >= 4:
-            storage_id = struct.unpack("<HH", payload[:4])[0]
-        if storage_id != 1:
+            storage_id = struct.unpack("<HH", payload[:4])
+        if storage_id != STORAGE_ID:
             response = self._build_response_container(
                 _MTP_OP_GET_STORAGE_IDS, _MTP_INVALID_STORAGE_ID, txn_id
             )
@@ -463,22 +522,39 @@ class MTPHandler:
         )
 
         response = self._build_response_container(
-            _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_OK, txn_id
+            _MTP_OP_GET_STORAGE_INFO, _MTP_RESP_OK, txn_id, data=storage_info
         )
-        return response, storage_info
+        return response, None
+
+    def _handle_get_object_handles(self, txn_id, payload):
+        """Return object handles"""
+        # 5.2.1 Storage IDs
+        self._scan_fs("/")
+
+        object_handles = struct.pack("<I", len(self.object_handles) - 1)
+        for idx in range(1, len(self.object_handles)):
+            # First 16 bits are the "physical storage", which can't be 0.
+            # Last 16 bits is the "logical storage", which also can't be 0.
+            object_handles.append(struct.pack("<I", 0x00010000 + idx))
+
+        response = self._build_response_container(
+            _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_OK, txn_id, data=object_handles
+        )
+
+        return response, None
 
     def _scan_fs(self, path: str):
         """Scan virtual FS and assign storage ID to all files and directories."""
-        if not self.storage_ids:
+        if not self.object_handles:
             # Initialize the list with / at ID 0 since that's illegal
             # for MTP for a real file/directory
-            self.storage_ids.append("/")
+            self.object_handles.append("/")
         for file_info in os.ilistdir(path):
             filename, filetype, _, _size = file_info
             full_path = path + filename
             if filetype == 0x4000:  # directory
                 self._scan_fs(full_path + "/")
-            if full_path not in self.storage_ids:
+            if full_path not in self.object_handles:
                 # Don't re-add already-identified filesystem objects
                 # in this session
-                self.storage_ids.append(full_path)
+                self.object_handles.append(full_path)
