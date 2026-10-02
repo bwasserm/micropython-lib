@@ -93,6 +93,7 @@ from usb.device.core import Interface, Buffer, split_bmRequestType
 # MTP Constants
 _EP_IN_FLAG = const(1 << 7)
 _BULK_EP_LEN = const(64)
+_INT_EP_LEN = const(28)
 
 # MTP Class Definitions
 _MTP_INTERFACE_CLASS = const(0x06)  # Still Image Device
@@ -118,17 +119,26 @@ _MTP_INVALID_STORAGE_ID = const(0x2008)
 # Appendix D, Table D.1
 _MTP_OP_GET_DEVICE_INFO = 0x1001
 _MTP_OP_OPEN_SESSION = 0x1002
+_MTP_OP_CLOSE_SESSION = 0x1003
 _MTP_OP_GET_STORAGE_IDS = 0x1004
 _MTP_OP_GET_STORAGE_INFO = 0x1005
 _MTP_OP_GET_NUM_OBJECTS = 0x1006
 _MTP_OP_GET_OBJECT_HANDLES = 0x1007
 _MTP_OP_GET_OBJECT_INFO = 0x1008
 _MTP_OP_GET_OBJECT = 0x1009
+_MTP_OP_DELETE_OBJECT = 0x100B
 _MTP_OP_SEND_OBJECT_INFO = 0x100C
 _MTP_OP_SEND_OBJECT = 0x100D
 _MTP_OP_RESET_DEVICE = 0x1010
+_MTP_OP_GET_DEVICE_PROP_DESC = 0x1014
+_MTP_OP_GET_DEVICE_PROP_VALUE = 0x1015
+_MTP_OP_SET_DEVICE_PROP_VALUE = 0x1016
 _MTP_OP_MOVE_OBJECT = 0x1019
 _MTP_OP_COPY_OBJECT = 0x101A
+_MTP_OP_GET_OBJECT_PROP_DESC = 0x9802
+_MTP_OP_GET_OBJECT_PROP_VALUE = 0x9803
+_MTP_OP_SET_OBJECT_PROP_VALUE = 0x9804
+_MTP_OP_GET_OBJECT_PROP_LIST = 0x9805
 
 # Event codes
 # Appendix G, Table G.1
@@ -136,10 +146,17 @@ _MTP_EVENT_UNDEFINED = 0x4000
 # _MTP_EVENT_CANCEL_TRANSACTION = 0x4001  # Don't know how to support this yet
 _MTP_EVENT_OBJECT_ADDED = 0x4002
 _MTP_EVENT_OBJECT_REMOVED = 0x4003
+_MTP_EVENT_ = 0x4003
+_MTP_EVENT_DEVICE_PROP_CHANGED = 0x4006
+_MTP_EVENT_OBJECT_INFO_CHANGED = 0x4007
+
 
 # Device Property codes
 # Apendix C, Table C.1
 _MTP_DEVICE_PROP_UNDEFINED = 0x5000
+_MTP_DEVICE_PROP_SYNCHRONIZATION_PARTNER = 0xD401
+_MTP_DEVICE_PROP_DEVICE_FRIENDLY_NAME = 0xD402
+_MTP_DEVICE_PROP_PERCEIVED_DEVICE_TYPE = 0xD407
 
 STORAGE_ID = 0x00010001
 
@@ -176,6 +193,7 @@ class MTPInterface(Interface):
         # Endpoint numbers (will be assigned during desc_cfg)
         self.ep_out = None
         self.ep_in = None
+        self.ev_ep_in = None
 
         # Buffers for bulk transfers
         self.tx_buf = Buffer(256)  # Response/data transmit buffer
@@ -194,10 +212,11 @@ class MTPInterface(Interface):
         # Single interface, no IAD needed
         desc.interface(
             itf_num,
-            2,  # bNumEndpoints: 2 (bulk IN, bulk OUT)
+            3,  # bNumEndpoints: 2 (bulk IN, bulk OUT, interrupt IN)
             _MTP_INTERFACE_CLASS,
             _MTP_INTERFACE_SUBCLASS,
             _MTP_INTERFACE_PROTOCOL,
+            iInterface=len(strs)
         )
 
         # Bulk OUT endpoint (device receives commands from host)
@@ -208,13 +227,19 @@ class MTPInterface(Interface):
         self.ep_in = ep_num | _EP_IN_FLAG
         desc.endpoint(self.ep_in, "bulk", _BULK_EP_LEN, 0)
 
+        # Interrupt IN endpoint (device sends events to host)
+        self.ev_ep_in = (ep_num + 1) | _EP_IN_FLAG
+        desc.endpoint(self.ev_ep_in, "interrupt", _INT_EP_LEN, 6)
+
+        strs.append("MTP")
+
     def num_itfs(self):
         """Number of interfaces in this descriptor group."""
         return 1
 
     def num_eps(self):
         """Number of endpoints (after masking _EP_IN_FLAG)."""
-        return 2
+        return 3
 
     def on_open(self):
         """Called when host opens this interface."""
@@ -403,11 +428,11 @@ class MTPHandler:
         # 5.1.1 DeviceInfo Dataset
         device_info_dataset = b""
         standard_version = struct.pack("<H", 100)  # 1.00
-        mtp_vendor_extension_id = struct.pack("<I", 0xFFFFFFFF)
+        mtp_vendor_extension_id = struct.pack("<I", 0x00000006)
         mtp_version = struct.pack(
-            "<H", 110
+            "<H", 0x0064
         )  # In hundreths. PDF is v1.1. Phone uses 0x0064
-        mtp_extensions = self._encode_string("")  # TODO: Fill in
+        mtp_extensions = self._encode_string("microsoft.com: 1.0; android.com: 1.0;")  # TODO: Fill in
         functional_mode = struct.pack("<H", 0x0000)  # Standard mode
         operations_supported = self._encode_array(
             "H",
@@ -415,23 +440,31 @@ class MTPHandler:
                 # Appendix D, Table D.1
                 _MTP_OP_GET_DEVICE_INFO,
                 _MTP_OP_OPEN_SESSION,
+                _MTP_OP_CLOSE_SESSION,
                 _MTP_OP_GET_STORAGE_IDS,
                 _MTP_OP_GET_STORAGE_INFO,
                 _MTP_OP_GET_NUM_OBJECTS,
                 _MTP_OP_GET_OBJECT_HANDLES,
                 _MTP_OP_GET_OBJECT_INFO,
                 _MTP_OP_GET_OBJECT,
+                _MTP_OP_DELETE_OBJECT,
+                _MTP_OP_GET_OBJECT_PROP_DESC,
                 _MTP_OP_SEND_OBJECT_INFO,
                 _MTP_OP_SEND_OBJECT,
                 _MTP_OP_RESET_DEVICE,
+                _MTP_OP_GET_DEVICE_PROP_DESC,
+                _MTP_OP_GET_DEVICE_PROP_VALUE,
+                _MTP_OP_SET_DEVICE_PROP_VALUE,
                 _MTP_OP_MOVE_OBJECT,
                 _MTP_OP_COPY_OBJECT,
+                _MTP_OP_GET_OBJECT_PROP_VALUE,
+                _MTP_OP_SET_OBJECT_PROP_VALUE,
+                _MTP_OP_GET_OBJECT_PROP_LIST
             ],
         )
         events_supported = self._encode_array(
             "H",
             [
-                _MTP_EVENT_UNDEFINED,
                 _MTP_EVENT_OBJECT_ADDED,
                 _MTP_EVENT_OBJECT_REMOVED,
             ],
@@ -439,7 +472,7 @@ class MTPHandler:
         device_properties_supported = self._encode_array(
             "H", [_MTP_DEVICE_PROP_UNDEFINED]
         )
-        capture_formats = self._encode_array("H", _MTP_SUPPORTED_OBJECT_FORMATS)
+        capture_formats = self._encode_array("H", [])
         playback_formats = self._encode_array(
             "H",
             _MTP_SUPPORTED_OBJECT_FORMATS,
