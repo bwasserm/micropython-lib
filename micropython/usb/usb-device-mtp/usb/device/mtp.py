@@ -196,8 +196,8 @@ class MTPInterface(Interface):
         self.ev_ep_in = None
 
         # Buffers for bulk transfers
-        self.tx_buf = Buffer(256)  # Response/data transmit buffer
-        self.rx_buf = Buffer(256)  # Command receive buffer
+        self.tx_buf = Buffer(2048)  # Response/data transmit buffer
+        self.rx_buf = Buffer(2048)  # Command receive buffer
 
         # Pending response state
         self.pending_response = None
@@ -392,8 +392,7 @@ class MTPHandler:
         if params:
             payload = struct.pack("<" + "I" * len(params), *params)
 
-        data = data or b""
-        length = 12 + len(payload) + len(data)
+        length = 12 + len(payload)
         if data:
             container_type = _MTP_CONTAINER_TYPE_DATA
             container_code = code
@@ -402,7 +401,7 @@ class MTPHandler:
             container_code = resp_code
         header = struct.pack("<IHHI", length, container_type, container_code, txn_id)
 
-        return header + payload + data
+        return header + payload, data
 
     def _encode_string(self, string: str):
         # Max len (including null terminator) is 255
@@ -428,11 +427,11 @@ class MTPHandler:
         # 5.1.1 DeviceInfo Dataset
         device_info_dataset = b""
         standard_version = struct.pack("<H", 100)  # 1.00
-        mtp_vendor_extension_id = struct.pack("<I", 0x00000006)
+        mtp_vendor_extension_id = struct.pack("<I", 0xFFFFFFFF)
         mtp_version = struct.pack(
             "<H", 0x0064
         )  # In hundreths. PDF is v1.1. Phone uses 0x0064
-        mtp_extensions = self._encode_string("microsoft.com: 1.0; android.com: 1.0;")  # TODO: Fill in
+        mtp_extensions = self._encode_string("hackaday.com: 1.0;")  # TODO: Fill in
         functional_mode = struct.pack("<H", 0x0000)  # Standard mode
         operations_supported = self._encode_array(
             "H",
@@ -475,7 +474,7 @@ class MTPHandler:
         capture_formats = self._encode_array("H", [])
         playback_formats = self._encode_array(
             "H",
-            _MTP_SUPPORTED_OBJECT_FORMATS,
+            _MTP_SUPPORTED_OBJECT_FORMATS
         )
         manufacturer = self._encode_string("HackADay")
         model = self._encode_string("SuperconBadge")
@@ -503,7 +502,7 @@ class MTPHandler:
         response = self._build_response(
             _MTP_OP_GET_DEVICE_INFO, _MTP_RESP_OK, txn_id, data=device_info_dataset
         )
-        return response, None
+        return response
 
     def _handle_open_session(self, txn_id, payload):
         """Initialize session."""
@@ -511,26 +510,26 @@ class MTPHandler:
         if len(payload) >= 4:
             self.session_id = struct.unpack("<I", payload[:4])[0]
         response = self._build_response(_MTP_OP_OPEN_SESSION, _MTP_RESP_OK, txn_id)
-        return response, None
+        return response
 
     def _handle_get_storage_ids(self, txn_id):
         """Return storage IDs."""
         # 5.2.1 Storage IDs
         storage_ids = self._encode_array("I", [STORAGE_ID])
-        response = self._build_response_container(
+        response = self._build_response(
             _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_OK, txn_id, data=storage_ids
         )
 
-        return response, None
+        return response
 
     def _handle_get_storage_info(self, txn_id, payload):
         if len(payload) >= 4:
             storage_id = struct.unpack("<HH", payload[:4])
         if storage_id != STORAGE_ID:
-            response = self._build_response_container(
+            response = self._build_response(
                 _MTP_OP_GET_STORAGE_IDS, _MTP_INVALID_STORAGE_ID, txn_id
             )
-            return response, None
+            return response
 
         # 5.2.2 StorageInfo Dataset Description
         storage_type = struct.pack("<H", 0x0003)  # Fixed RAM
@@ -554,10 +553,10 @@ class MTPHandler:
             + volume_identifier
         )
 
-        response = self._build_response_container(
+        response = self._build_response(
             _MTP_OP_GET_STORAGE_INFO, _MTP_RESP_OK, txn_id, data=storage_info
         )
-        return response, None
+        return response
 
     def _handle_get_object_handles(self, txn_id, payload):
         """Return object handles"""
@@ -570,11 +569,11 @@ class MTPHandler:
             # Last 16 bits is the "logical storage", which also can't be 0.
             object_handles.append(struct.pack("<I", 0x00010000 + idx))
 
-        response = self._build_response_container(
+        response = self._build_response(
             _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_OK, txn_id, data=object_handles
         )
 
-        return response, None
+        return response
 
     def _scan_fs(self, path: str):
         """Scan virtual FS and assign storage ID to all files and directories."""
