@@ -318,33 +318,63 @@ class MTPInterface(Interface):
             and not self.xfer_pending(self.ep_in)
             and self.pending_response
         ):
-            # Send response container first
-            self.submit_xfer(
-                self.ep_in,
-                self.pending_response,
-                self._send_cb,
-            )
+            # # Send response container first
+            # self.submit_xfer(
+            #     self.ep_in,
+            #     self.pending_response,
+            #     self._send_cb,
+            # )
 
-    def _send_cb(self, ep, res, num_bytes):
+            # if not self.is_open() or self.xfer_pending(self.ep_in):
+            #     return
+            
+            # Priority: data first (if pending), then response
+            if self.pending_data is not None:
+                self.submit_xfer(
+                    self.ep_in,
+                    self.pending_data,  # Raw bytes, NO container
+                    self._send_data_cb,
+                )
+            elif self.pending_response is not None:
+                self.submit_xfer(
+                    self.ep_in,
+                    self.pending_response,  # Response container header
+                    self._send_response_cb,
+                )
+
+    def _send_response_cb(self, ep, res, num_bytes):
         """Callback when response sent."""
         if res == 0:
             self.pending_response = None
 
             # If there's data payload, send it next
-            if self.pending_data:
-                self.submit_xfer(
-                    self.ep_in,
-                    self.pending_data,
-                    self._send_data_cb,
-                )
-            else:
-                self._recv_cmd()  # Resume listening for commands
+            # if self.pending_data:
+            #     self.submit_xfer(
+            #         self.ep_in,
+            #         self.pending_data,
+            #         self._send_data_cb,
+            #     )
+            # else:
+        self._recv_cmd()  # Resume listening for commands
+
+    # def _send_data_cb(self, ep, res, num_bytes):
+    #     """Callback when data payload sent."""
+    #     if res == 0:
+    #         self.pending_data = None
+    #         self._recv_cmd()  # Resume listening for commands
 
     def _send_data_cb(self, ep, res, num_bytes):
-        """Callback when data payload sent."""
-        if res == 0:
-            self.pending_data = None
-            self._recv_cmd()  # Resume listening for commands
+        """Data sent — now queue response."""
+        self.pending_data = None
+        
+        if res == 0 and self.pending_response is not None:
+            self.submit_xfer(
+                self.ep_in,
+                self.pending_response,
+                self._send_response_cb,
+            )
+        else:
+            self._recv_cmd()
 
 
 class MTPHandler:
@@ -384,7 +414,7 @@ class MTPHandler:
         # _MTP_OP_COPY_OBJECT
         else:
             # Unknown operation
-            return self._build_response(code, _MTP_RESP_INVALID_OPERATION, txn_id), None
+            return self._build_response(code, _MTP_RESP_INVALID_OPERATION, txn_id)
 
     def _build_response(self, code, resp_code, txn_id, params=None, data=None):
         """Build MTP response container."""
@@ -392,16 +422,18 @@ class MTPHandler:
         if params:
             payload = struct.pack("<" + "I" * len(params), *params)
 
-        length = 12 + len(payload)
-        if data:
-            container_type = _MTP_CONTAINER_TYPE_DATA
-            container_code = code
-        else:
-            container_type = _MTP_CONTAINER_TYPE_RESPONSE
-            container_code = resp_code
-        header = struct.pack("<IHHI", length, container_type, container_code, txn_id)
 
-        return header + payload, data
+        length = 12 + len(payload)
+        resp_header = struct.pack("<IHHI", length, _MTP_CONTAINER_TYPE_RESPONSE, resp_code, txn_id)
+
+        if data:
+            data_length = 12 + len(data)
+            data_header = struct.pack("<IHHI", data_length, _MTP_CONTAINER_TYPE_DATA, code, txn_id)
+            resp_data = data_header + data
+        else:
+            resp_data = None
+
+        return resp_header + payload, resp_data
 
     def _encode_string(self, string: str):
         # Max len (including null terminator) is 255
