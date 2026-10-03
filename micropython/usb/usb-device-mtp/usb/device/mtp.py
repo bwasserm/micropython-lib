@@ -113,7 +113,10 @@ _MTP_CONTAINER_TYPE_RESPONSE = const(3)
 # MTP Response codes
 _MTP_RESP_OK = const(0x2001)
 _MTP_RESP_INVALID_OPERATION = const(0x2002)
-_MTP_INVALID_STORAGE_ID = const(0x2008)
+_MTP_RESP_INVALID_STORAGE_ID = const(0x2008)
+_MTP_RESP_INVALID_OBJECT_HANDLE = const(0x2009)
+_MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED = const(0x2014)
+_MTP_RESP_INVALID_PARAMETER = const(0x201D)
 
 # Operation codes
 # Appendix D, Table D.1
@@ -404,7 +407,8 @@ class MTPHandler:
         elif code == _MTP_OP_GET_STORAGE_INFO:
             return self._handle_get_storage_info(txn_id, payload)
         # _MTP_OP_GET_NUM_OBJECTS
-        # _MTP_OP_GET_OBJECT_HANDLES
+        elif code == _MTP_OP_GET_OBJECT_HANDLES:
+            return self._handle_get_object_handles(txn_id, payload)
         # _MTP_OP_GET_OBJECT_INFO
         # _MTP_OP_GET_OBJECT
         # _MTP_OP_SEND_OBJECT_INFO
@@ -463,7 +467,7 @@ class MTPHandler:
         mtp_version = struct.pack(
             "<H", 0x0064
         )  # In hundreths. PDF is v1.1. Phone uses 0x0064
-        mtp_extensions = self._encode_string("hackaday.com: 1.0;")  # TODO: Fill in
+        mtp_extensions = self._encode_string("")  # TODO: Fill in
         functional_mode = struct.pack("<H", 0x0000)  # Standard mode
         operations_supported = self._encode_array(
             "H",
@@ -508,9 +512,9 @@ class MTPHandler:
             "H",
             _MTP_SUPPORTED_OBJECT_FORMATS
         )
-        manufacturer = self._encode_string("HackADay")
-        model = self._encode_string("SuperconBadge")
-        device_version = self._encode_string("0x0A")
+        manufacturer = self._encode_string("")
+        model = self._encode_string("")
+        device_version = self._encode_string("")
         base_id = "".join([hex(b)[2:4].upper() for b in machine.unique_id()])
         serial_number = self._encode_string(
             "0" * (32 - len(base_id)) + base_id
@@ -556,10 +560,11 @@ class MTPHandler:
 
     def _handle_get_storage_info(self, txn_id, payload):
         if len(payload) >= 4:
-            storage_id = struct.unpack("<HH", payload[:4])
+            storage_id = struct.unpack("<I", payload[:4])[0]
+            self.requested_storage_id = storage_id
         if storage_id != STORAGE_ID:
             response = self._build_response(
-                _MTP_OP_GET_STORAGE_IDS, _MTP_INVALID_STORAGE_ID, txn_id
+                _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_INVALID_STORAGE_ID, txn_id
             )
             return response
 
@@ -567,12 +572,12 @@ class MTPHandler:
         storage_type = struct.pack("<H", 0x0003)  # Fixed RAM
         filesystem_type = struct.pack("<H", 0x0002)  # Generic hierarchical
         access_capability = struct.pack("<H", 0x0000)  # Read-write
-        bsize, frsize, blocks, bfree, _, _, _, _, namemax = os.statvfs()
+        bsize, frsize, blocks, bfree, _, _, _, _, _, _ = os.statvfs('/')
         max_capacity = struct.pack("<Q", frsize * blocks)
         free_space = struct.pack("<Q", bfree * bsize)
         free_objects = struct.pack("<Q", 0xFFFFFFFF)  # Unused field
-        storage_description = self._encode_string("Badge Virtual FS")
-        volume_identifier = self._encode_string(machine.unique_id())
+        storage_description = self._encode_string("Micropython")
+        volume_identifier = self._encode_string(''.join([hex(b)[2:4] for b in machine.unique_id()]))
 
         storage_info = (
             storage_type
@@ -592,17 +597,38 @@ class MTPHandler:
 
     def _handle_get_object_handles(self, txn_id, payload):
         """Return object handles"""
-        # 5.2.1 Storage IDs
-        self._scan_fs("/")
+        # D.2.7 GetObjectHandles
 
-        object_handles = struct.pack("<I", len(self.object_handles) - 1)
-        for idx in range(1, len(self.object_handles)):
-            # First 16 bits are the "physical storage", which can't be 0.
-            # Last 16 bits is the "logical storage", which also can't be 0.
-            object_handles.append(struct.pack("<I", 0x00010000 + idx))
+        if len(payload) >= 12:
+            storage_id, object_format_code, parent_id = struct.unpack("<III", payload[0:12])
+        else:
+            return self._build_response(_MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_INVALID_PARAMETER, txn_id)
+
+        if storage_id != STORAGE_ID:
+            self._build_response(
+                _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_INVALID_STORAGE_ID, txn_id
+            )
+        if object_format_code != 0x00:
+            return self._build_response(
+                _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED, txn_id
+            )
+        self._scan_fs("/")
+        if parent_id == 0xFFFFFFFF:  # List all object in /
+            handles = self._get_object_handles_in_path("/")
+        elif parent_id == 0x00000000:
+            handles = list(range(1, len(self.object_handles) + 1))
+        else:
+            if parent_id in self.object_handles:
+                handles = self._get_object_handles_in_path(self.object_handles[parent_id])
+            else:
+                return self._build_response(
+                    _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+                )
+
+        data = self._encode_array("I", handles)
 
         response = self._build_response(
-            _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_OK, txn_id, data=object_handles
+            _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_OK, txn_id, data=data
         )
 
         return response
@@ -622,3 +648,13 @@ class MTPHandler:
                 # Don't re-add already-identified filesystem objects
                 # in this session
                 self.object_handles.append(full_path)
+
+    def _get_object_handles_in_path(self, path: str) -> list:
+        handles = []
+        if path == "/":
+            path = ""  # Special case since root / gets dropped by split
+        for handle, object in enumerate(self.object_handles[1:], 1):
+            parent, _ = object.rsplit("/", 1)
+            if parent == path:
+                handles.append(handle)
+        return handles
