@@ -84,11 +84,13 @@
 
 #         return True  # allow DATA/ACK stages to complete normally
 
+
 import os
 import struct
+
 import machine
 from micropython import const
-from usb.device.core import Interface, Buffer, split_bmRequestType
+from usb.device.core import Buffer, Interface
 
 # MTP Constants
 _EP_IN_FLAG = const(1 << 7)
@@ -125,7 +127,7 @@ _MTP_OP_OPEN_SESSION = 0x1002
 _MTP_OP_CLOSE_SESSION = 0x1003
 _MTP_OP_GET_STORAGE_IDS = 0x1004
 _MTP_OP_GET_STORAGE_INFO = 0x1005
-_MTP_OP_GET_NUM_OBJECTS = 0x1006
+# _MTP_OP_GET_NUM_OBJECTS = 0x1006
 _MTP_OP_GET_OBJECT_HANDLES = 0x1007
 _MTP_OP_GET_OBJECT_INFO = 0x1008
 _MTP_OP_GET_OBJECT = 0x1009
@@ -164,19 +166,105 @@ _MTP_DEVICE_PROP_PERCEIVED_DEVICE_TYPE = 0xD407
 STORAGE_ID = 0x00010001
 
 # Supported formats
+_MTP_OBJECT_FORMAT_UNIDENTIFIED = const(0x3000)
+_MTP_OBJECT_FORMAT_ASSOCIATION = const(0x3001)
+_MTP_OBJECT_FORMAT_SCRIPT = const(0x3002)
+_MTP_OBJECT_FORMAT_TEXT = const(0x3004)
+_MTP_OBJECT_FORMAT_UNDEFINED_IMAGE = const(0x3800)
+_MTP_OBJECT_FORMAT_JPEG = const(0x3801)
+_MTP_OBJECT_FORMAT_BMP = const(0x3804)
+_MTP_OBJECT_FORMAT_GIF = const(0x3807)
+_MTP_OBJECT_FORMAT_PNG = const(0x380B)
+
 _MTP_SUPPORTED_OBJECT_FORMATS = [
     # Appendix A. Table A.1
-    0x3000,  # unidentified
-    0x3001,  # association (folder)
-    0x3002,  # script
-    0x3004,  # text
-    0x3800,  # undefined image
-    0x3801,  # JPEG
-    0x3804,  # BMP
-    0x3807,  # GIF
-    0x380B,  # PNG
+    _MTP_OBJECT_FORMAT_UNIDENTIFIED,
+    _MTP_OBJECT_FORMAT_ASSOCIATION,
+    _MTP_OBJECT_FORMAT_SCRIPT,
+    _MTP_OBJECT_FORMAT_TEXT,
+    _MTP_OBJECT_FORMAT_UNDEFINED_IMAGE,
+    _MTP_OBJECT_FORMAT_JPEG,
+    _MTP_OBJECT_FORMAT_BMP,
+    _MTP_OBJECT_FORMAT_GIF,
+    _MTP_OBJECT_FORMAT_PNG,
 ]
 
+
+class FsObject:
+    def __init__(self, basename, parent_path, parent_handle, size, handle, isdir):
+        print(basename, parent_path, parent_handle, size, handle, isdir)
+        self.basename: str = basename
+        self.parent_path: str = parent_path
+        self.parent_handle: int = parent_handle  # uint32
+        self.size: int = size  # uint32
+        self.handle: int = handle  # uint32
+        self.format_code: int = 0
+        self.isdir = isdir
+        self.full_path = self.parent_path + ("/" if self.parent_path != "/" else "") + self.basename
+        print(self.full_path)
+
+        parts = basename.split(".", 1)
+        if isdir:
+            self.format_code = _MTP_OBJECT_FORMAT_ASSOCIATION
+        elif len(parts) == 1:
+            self.format_code = _MTP_OBJECT_FORMAT_UNIDENTIFIED
+        elif parts[1] == "py":
+            self.format_code = _MTP_OBJECT_FORMAT_TEXT
+        elif parts[1] == "pyc":
+            self.format_code = _MTP_OBJECT_FORMAT_SCRIPT
+        elif parts[1] == "jpg" or parts[1] == "jpeg":
+            self.format_code = _MTP_OBJECT_FORMAT_JPEG
+        elif parts[1] == "bmp":
+            self.format_code = _MTP_OBJECT_FORMAT_BMP
+        elif parts[1] == "gif":
+            self.format_code = _MTP_OBJECT_FORMAT_GIF
+        elif parts[1] == "png":
+            self.format_code = _MTP_OBJECT_FORMAT_PNG
+        else:
+            self.format_code = _MTP_OBJECT_FORMAT_UNIDENTIFIED
+
+class ObjectHandles:
+    def __init__(self):
+        # Don't need the key:value lookup of a dict. Not hashable probably, so can't use set.
+        self.objects: list[FsObject] = []
+
+    def reset(self):
+        del self.objects[:-1]
+
+    def add(self, dirname: str, basename: str, size: int, isdir: bool):
+        full_path = dirname + ("/" if dirname != "/" else "") + basename
+        if any(full_path == o.full_path for o in self.objects):
+            return
+        if dirname == "/":
+            parent_handle = 0xFFFFFFFF
+        else:
+            parent_handle = self.get_handle(dirname)
+        handle = len(self.objects) + 1
+        self.objects.append(FsObject(basename, dirname, parent_handle, size, handle, isdir))
+
+    def get_children(self, handle: int = 0, path: str = "") -> list[FsObject]:
+        children = []
+        for obj in self.objects:
+            if (handle and handle == obj.parent_handle) or (path and path == obj.parent_path):
+                children.append(obj)
+        return children
+
+    def get_children_handles(self, handle: int) -> list[int]:
+        if handle == 0x00000000:  # Get all
+            return [o.handle for o in self.objects]
+        return [o.handle for o in self.objects if o.parent_handle == handle]
+
+    def get(self, handle: int) -> FsObject:
+        objs = [o for o in self.objects if o.handle == handle]
+        if len(objs) == 1:
+            return objs[0]
+        return None
+
+    def get_handle(self, full_path: str) -> int:
+        objs = [o for o in self.objects if o.full_path == full_path]
+        if len(objs) == 1:
+            return objs[0].handle
+        return None
 
 class MTPInterface(Interface):
     """
@@ -385,7 +473,7 @@ class MTPHandler:
 
     def __init__(self):
         self.session_id = None
-        self.object_handles = []
+        self.object_handles = ObjectHandles()
 
     def handle_command(self, container):
         """
@@ -402,6 +490,8 @@ class MTPHandler:
             return self._handle_get_device_info(txn_id)
         elif code == _MTP_OP_OPEN_SESSION:
             return self._handle_open_session(txn_id, payload)
+        elif code == _MTP_OP_CLOSE_SESSION:
+            return self._handle_close_session(txn_id)
         elif code == _MTP_OP_GET_STORAGE_IDS:
             return self._handle_get_storage_ids(txn_id)
         elif code == _MTP_OP_GET_STORAGE_INFO:
@@ -409,7 +499,8 @@ class MTPHandler:
         # _MTP_OP_GET_NUM_OBJECTS
         elif code == _MTP_OP_GET_OBJECT_HANDLES:
             return self._handle_get_object_handles(txn_id, payload)
-        # _MTP_OP_GET_OBJECT_INFO
+        elif code == _MTP_OP_GET_OBJECT_INFO:
+            return self._handle_get_object_info(txn_id, payload)
         # _MTP_OP_GET_OBJECT
         # _MTP_OP_SEND_OBJECT_INFO
         # _MTP_OP_SEND_OBJECT
@@ -475,25 +566,25 @@ class MTPHandler:
                 # Appendix D, Table D.1
                 _MTP_OP_GET_DEVICE_INFO,
                 _MTP_OP_OPEN_SESSION,
-                _MTP_OP_CLOSE_SESSION,
+                # _MTP_OP_CLOSE_SESSION,
                 _MTP_OP_GET_STORAGE_IDS,
                 _MTP_OP_GET_STORAGE_INFO,
-                _MTP_OP_GET_NUM_OBJECTS,
+                # _MTP_OP_GET_NUM_OBJECTS,
                 _MTP_OP_GET_OBJECT_HANDLES,
                 _MTP_OP_GET_OBJECT_INFO,
-                _MTP_OP_GET_OBJECT,
-                _MTP_OP_DELETE_OBJECT,
-                _MTP_OP_GET_OBJECT_PROP_DESC,
-                _MTP_OP_SEND_OBJECT_INFO,
-                _MTP_OP_SEND_OBJECT,
-                _MTP_OP_RESET_DEVICE,
-                _MTP_OP_GET_DEVICE_PROP_DESC,
-                _MTP_OP_GET_DEVICE_PROP_VALUE,
-                _MTP_OP_SET_DEVICE_PROP_VALUE,
-                _MTP_OP_MOVE_OBJECT,
-                _MTP_OP_COPY_OBJECT,
-                _MTP_OP_GET_OBJECT_PROP_VALUE,
-                _MTP_OP_SET_OBJECT_PROP_VALUE,
+                # _MTP_OP_GET_OBJECT,
+                # _MTP_OP_DELETE_OBJECT,
+                # _MTP_OP_GET_OBJECT_PROP_DESC,
+                # _MTP_OP_SEND_OBJECT_INFO,
+                # _MTP_OP_SEND_OBJECT,
+                # _MTP_OP_RESET_DEVICE,
+                # _MTP_OP_GET_DEVICE_PROP_DESC,
+                # _MTP_OP_GET_DEVICE_PROP_VALUE,
+                # _MTP_OP_SET_DEVICE_PROP_VALUE,
+                # _MTP_OP_MOVE_OBJECT,
+                # _MTP_OP_COPY_OBJECT,
+                # _MTP_OP_GET_OBJECT_PROP_VALUE,
+                # _MTP_OP_SET_OBJECT_PROP_VALUE,
                 _MTP_OP_GET_OBJECT_PROP_LIST
             ],
         )
@@ -548,6 +639,11 @@ class MTPHandler:
         response = self._build_response(_MTP_OP_OPEN_SESSION, _MTP_RESP_OK, txn_id)
         return response
 
+    def _handle_close_session(self, txn_id):
+        self.object_handles.reset()
+        response = self._build_response(_MTP_OP_CLOSE_SESSION, _MTP_RESP_OK, txn_id)
+        return response
+
     def _handle_get_storage_ids(self, txn_id):
         """Return storage IDs."""
         # 5.2.1 Storage IDs
@@ -561,7 +657,6 @@ class MTPHandler:
     def _handle_get_storage_info(self, txn_id, payload):
         if len(payload) >= 4:
             storage_id = struct.unpack("<I", payload[:4])[0]
-            self.requested_storage_id = storage_id
         if storage_id != STORAGE_ID:
             response = self._build_response(
                 _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_INVALID_STORAGE_ID, txn_id
@@ -608,22 +703,26 @@ class MTPHandler:
             self._build_response(
                 _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_INVALID_STORAGE_ID, txn_id
             )
-        if object_format_code != 0x00:
+        if object_format_code != 0x00000000:
+            # Don't support filtering by format code
+            # TODO eventually support this?
             return self._build_response(
                 _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED, txn_id
             )
         self._scan_fs("/")
-        if parent_id == 0xFFFFFFFF:  # List all object in /
-            handles = self._get_object_handles_in_path("/")
-        elif parent_id == 0x00000000:
-            handles = list(range(1, len(self.object_handles) + 1))
-        else:
-            if parent_id in self.object_handles:
-                handles = self._get_object_handles_in_path(self.object_handles[parent_id])
-            else:
-                return self._build_response(
-                    _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
-                )
+        handles = self.object_handles.get_children_handles(parent_id)
+
+        # if parent_id == 0xFFFFFFFF:  # List all object in /
+        #     handles = self._get_object_handles_in_path("/")
+        # elif parent_id == 0x00000000:
+        #     handles = list(range(1, len(self.object_handles) + 1))
+        # else:
+        #     if parent_id in self.object_handles:
+        #         handles = self._get_object_handles_in_path(self.object_handles[parent_id])
+        #     else:
+        #         return self._build_response(
+        #             _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+        #         )
 
         data = self._encode_array("I", handles)
 
@@ -635,26 +734,49 @@ class MTPHandler:
 
     def _scan_fs(self, path: str):
         """Scan virtual FS and assign storage ID to all files and directories."""
-        if not self.object_handles:
-            # Initialize the list with / at ID 0 since that's illegal
-            # for MTP for a real file/directory
-            self.object_handles.append("/")
         for file_info in os.ilistdir(path):
-            filename, filetype, _, _size = file_info
-            full_path = path + filename
-            if filetype == 0x4000:  # directory
-                self._scan_fs(full_path + "/")
-            if full_path not in self.object_handles:
-                # Don't re-add already-identified filesystem objects
-                # in this session
-                self.object_handles.append(full_path)
+            filename, filetype, _, size = file_info
+            full_path = path + ("/" if path != "/" else "") + filename
+            isdir = filetype == 0x4000  # directory
+            self.object_handles.add(path, filename, size, isdir)
+            if isdir:
+                self._scan_fs(full_path)
 
-    def _get_object_handles_in_path(self, path: str) -> list:
-        handles = []
-        if path == "/":
-            path = ""  # Special case since root / gets dropped by split
-        for handle, object in enumerate(self.object_handles[1:], 1):
-            parent, _ = object.rsplit("/", 1)
-            if parent == path:
-                handles.append(handle)
-        return handles
+    def _handle_get_object_info(self, txn_id, payload):
+        # D.2.8
+        if len(payload) >= 4:
+            object_handle = struct.unpack("<I", payload[:4])[0]
+        object = self.object_handles.get(object_handle)
+        if object is None:
+            response = self._build_response(
+                _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+            )
+            return response
+
+        # 5.3.1 ObjectInfo Dataset Description
+        object_info = struct.pack("<IHHIHIIIIIIIHII",
+            STORAGE_ID,
+            object.format_code, # ObjectFormatCode
+            0x0000, # Protection Status - Unprotected
+            object.size, # Compressed Size
+            0x0000, # Thumb Format
+            0x00000000, # Thumb Compressed Size
+            0x00000000, # Thumb Pix Width
+            0x00000000, # Thumb Pix Height
+            0x00000000, # Image Pix Width
+            0x00000000, # Image Pix Height
+            0x00000000, # Image Bit Depth
+            object.parent_handle,  # Parent Object
+            0x0001 if object.isdir else 0x0000,  # Association Type
+            0x00000000,  # Association Description
+            0x0000000  # Sequence Number
+        ) + (self._encode_string(object.basename)  # Filename
+        + self._encode_string("")  # Date Created
+        + self._encode_string("")  # Date Modified
+        + self._encode_string(""))  # Keywords
+        print(object_info)
+
+        response = self._build_response(
+            _MTP_OP_GET_OBJECT_INFO, _MTP_RESP_OK, txn_id, data=object_info
+        )
+        return response
