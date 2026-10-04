@@ -494,7 +494,8 @@ class MTPHandler:
             return self._handle_get_object_info(txn_id, payload)
         elif code == _MTP_OP_GET_OBJECT_PROP_LIST:
             return self._handle_get_object_prop_list(txn_id, payload)
-        # _MTP_OP_GET_OBJECT
+        elif code == _MTP_OP_GET_OBJECT:
+            return self._handle_get_object(txn_id, payload)
         # _MTP_OP_SEND_OBJECT_INFO
         # _MTP_OP_SEND_OBJECT
         # _MTP_OP_RESET_DEVICE
@@ -800,5 +801,29 @@ class MTPHandler:
             object_prop_list_bytes += prop[3]
         response = self._build_response(
             _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_OK, txn_id, data=object_prop_list_bytes
+        )
+        return response
+
+    def _handle_get_object(self, txn_id, payload):
+        # D.2.9
+        if len(payload) >= 4:
+            object_handle = struct.unpack("<I", payload[:4])[0]
+        object = self.object_handles.get(object_handle)
+        if object is None:
+            response = self._build_response(
+                _MTP_OP_GET_OBJECT, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+            )
+            return response
+        if object.isdir:
+            response = self._build_response(
+                _MTP_OP_GET_OBJECT, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+            )
+            return response
+        object_bytes = b''
+        with open(object.full_path, 'rb') as obj_f:
+            object_bytes = obj_f.read()
+
+        response = self._build_response(
+            _MTP_OP_GET_OBJECT, _MTP_RESP_OK, txn_id, data=object_bytes
         )
         return response
