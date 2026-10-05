@@ -278,7 +278,7 @@ class MTPInterface(Interface):
         self.ev_ep_in = None
 
         # Buffers for bulk transfers
-        self.tx_buf = Buffer(2048)  # Response/data transmit buffer
+        # self.tx_buf = Buffer(2048)  # Response/data transmit buffer
         self.rx_buf = Buffer(2048)  # Command receive buffer
 
         # Pending response state
@@ -428,28 +428,25 @@ class MTPInterface(Interface):
         """Callback when response sent."""
         if res == 0:
             self.pending_response = None
-
-            # If there's data payload, send it next
-            # if self.pending_data:
-            #     self.submit_xfer(
-            #         self.ep_in,
-            #         self.pending_data,
-            #         self._send_data_cb,
-            #     )
-            # else:
         self._recv_cmd()  # Resume listening for commands
-
-    # def _send_data_cb(self, ep, res, num_bytes):
-    #     """Callback when data payload sent."""
-    #     if res == 0:
-    #         self.pending_data = None
-    #         self._recv_cmd()  # Resume listening for commands
 
     def _send_data_cb(self, ep, res, num_bytes):
         """Data sent — now queue response."""
+
+        if res != 0:
+            print(f"Data xfer failed: res={res}")
+            self._recv_cmd()
+            return
+
+        while self.xfer_pending(self.ep_in):
+            pass
+
+        print(f"Data transfer complete: {num_bytes} bytes")
         self.pending_data = None
         
-        if res == 0 and self.pending_response is not None:
+        # Only now queue the response
+        if self.pending_response is not None:
+            print("Queueing response container")
             self.submit_xfer(
                 self.ep_in,
                 self.pending_response,
@@ -730,7 +727,6 @@ class MTPHandler:
         + _encode_string("")  # Date Created
         + _encode_string("")  # Date Modified
         + _encode_string(""))  # Keywords
-        print(object_info)
 
         return self._build_response(
             _MTP_OP_GET_OBJECT_INFO, _MTP_RESP_OK, txn_id, data=object_info
