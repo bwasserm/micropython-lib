@@ -601,42 +601,36 @@ class MTPHandler:
             + device_version
             + serial_number
         )
-        response = self._build_response(
+        return self._build_response(
             _MTP_OP_GET_DEVICE_INFO, _MTP_RESP_OK, txn_id, data=device_info_dataset
         )
-        return response
 
     def _handle_open_session(self, txn_id, payload):
         """Initialize session."""
         self._scan_fs("/")
         if len(payload) >= 4:
             self.session_id = struct.unpack("<I", payload[:4])[0]
-        response = self._build_response(_MTP_OP_OPEN_SESSION, _MTP_RESP_OK, txn_id)
-        return response
+        return self._build_response(_MTP_OP_OPEN_SESSION, _MTP_RESP_OK, txn_id)
 
     def _handle_close_session(self, txn_id):
         self.object_handles.reset()
-        response = self._build_response(_MTP_OP_CLOSE_SESSION, _MTP_RESP_OK, txn_id)
-        return response
+        return self._build_response(_MTP_OP_CLOSE_SESSION, _MTP_RESP_OK, txn_id)
 
     def _handle_get_storage_ids(self, txn_id):
         """Return storage IDs."""
         # 5.2.1 Storage IDs
         storage_ids = _encode_array("I", [STORAGE_ID])
-        response = self._build_response(
+        return self._build_response(
             _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_OK, txn_id, data=storage_ids
         )
-
-        return response
 
     def _handle_get_storage_info(self, txn_id, payload):
         if len(payload) >= 4:
             storage_id = struct.unpack("<I", payload[:4])[0]
         if storage_id != STORAGE_ID:
-            response = self._build_response(
+            return self._build_response(
                 _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_INVALID_STORAGE_ID, txn_id
             )
-            return response
 
         # 5.2.2 StorageInfo Dataset Description
         storage_type = struct.pack("<H", 0x0003)  # Fixed RAM
@@ -660,10 +654,9 @@ class MTPHandler:
             + volume_identifier
         )
 
-        response = self._build_response(
+        return self._build_response(
             _MTP_OP_GET_STORAGE_INFO, _MTP_RESP_OK, txn_id, data=storage_info
         )
-        return response
 
     def _handle_get_object_handles(self, txn_id, payload):
         """Return object handles"""
@@ -692,10 +685,9 @@ class MTPHandler:
         handles = self.object_handles.get_children_handles(parent_id)
         data = _encode_array("I", handles)
 
-        response = self._build_response(
+        return self._build_response(
             _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_OK, txn_id, data=data
         )
-        return response
 
     def _scan_fs(self, path: str):
         """Scan virtual FS and assign storage ID to all files and directories."""
@@ -713,10 +705,9 @@ class MTPHandler:
             object_handle = struct.unpack("<I", payload[:4])[0]
         object = self.object_handles.get(object_handle)
         if object is None:
-            response = self._build_response(
+            return self._build_response(
                 _MTP_OP_GET_STORAGE_IDS, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
             )
-            return response
 
         # 5.3.1 ObjectInfo Dataset Description
         object_info = struct.pack("<IHHIHIIIIIIIHII",
@@ -741,18 +732,16 @@ class MTPHandler:
         + _encode_string(""))  # Keywords
         print(object_info)
 
-        response = self._build_response(
+        return self._build_response(
             _MTP_OP_GET_OBJECT_INFO, _MTP_RESP_OK, txn_id, data=object_info
         )
-        return response
 
     def _handle_get_object_prop_list(self, txn_id, payload):
         # E.2.1
         if len(payload) < 20:  # 5 uint32's
-            response = self._build_response(
+            return self._build_response(
                 _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
-            )
-            return response 
+            ) 
         object_handle, object_format_code, object_prop_code, _, depth = struct.unpack("<IIIII", payload[:20])
         if object_handle == 0xFFFFFFFF:  # All objects
             objects = self.object_handles.objects
@@ -761,22 +750,19 @@ class MTPHandler:
         else:
             objects = [self.object_handles.get(object_handle)]
             if objects[0] is None:
-                response = self._build_response(
+                return self._build_response(
                     _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
                 )
-                return response
         if object_format_code != 0x00000000:
-            response = self._build_response(
+            return self._build_response(
                 _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED, txn_id
             )
-            return response
         if object_prop_code == 0xFFFFFFFF:
             prop_codes_requested = _MTP_SUPPORTED_OBJECT_PROPERTIES
         elif object_prop_code == 0x00000000:  # Get group code from 4th param not supported
-            response = self._build_response(
+            return self._build_response(
                 _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_SPECIFICATION_BY_GROUP_NOT_SUPPORTED, txn_id
             )
-            return response
         else:
             prop_codes_requested = [object_prop_code]
         if depth == 0x00000000 and object_handle == 0x00000000:
@@ -784,10 +770,9 @@ class MTPHandler:
         elif depth == 1:
             objects = self.object_handles.get_children_handles(object_handle)
         elif depth > 1:
-            response = self._build_response(
+            return self._build_response(
                 _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_SPECIFICATION_BY_DEPTH_UNSUPPORTED, txn_id
             )
-            return response
         # else depth = 0, so objects = [object_handle], set above
 
         prop_list = []
@@ -799,10 +784,9 @@ class MTPHandler:
         for prop in prop_list:
             object_prop_list_bytes += struct.pack("<IHH", prop[0], prop[1], prop[2])
             object_prop_list_bytes += prop[3]
-        response = self._build_response(
+        return self._build_response(
             _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_OK, txn_id, data=object_prop_list_bytes
         )
-        return response
 
     def _handle_get_object(self, txn_id, payload):
         # D.2.9
@@ -810,20 +794,17 @@ class MTPHandler:
             object_handle = struct.unpack("<I", payload[:4])[0]
         object = self.object_handles.get(object_handle)
         if object is None:
-            response = self._build_response(
+            return self._build_response(
                 _MTP_OP_GET_OBJECT, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
             )
-            return response
         if object.isdir:
-            response = self._build_response(
+            return self._build_response(
                 _MTP_OP_GET_OBJECT, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
             )
-            return response
         object_bytes = b''
         with open(object.full_path, 'rb') as obj_f:
             object_bytes = obj_f.read()
 
-        response = self._build_response(
+        return self._build_response(
             _MTP_OP_GET_OBJECT, _MTP_RESP_OK, txn_id, data=object_bytes
         )
-        return response
