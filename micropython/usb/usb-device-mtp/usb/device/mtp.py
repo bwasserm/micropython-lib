@@ -284,6 +284,9 @@ class MTPInterface(Interface):
         # Pending response state
         self.pending_response = None
         self.pending_data = None
+        # For sending files back
+        self.response_filename = None
+        self.pending_file = None
 
     def desc_cfg(self, desc, itf_num, ep_num, strs):
         """
@@ -374,7 +377,7 @@ class MTPInterface(Interface):
             return  # Invalid container header
 
         # Parse MTP container header
-        length, container_type, code, txn_id = struct.unpack("<IHHH", data[:12])
+        length, container_type, code, txn_id = struct.unpack("<IHHI", data[:12])
         payload = data[12:length] if len(data) > 12 else b""
 
         container = {
@@ -386,36 +389,42 @@ class MTPInterface(Interface):
 
         # Dispatch to handler
         if self.mtp_handler:
-            response, response_data = self.mtp_handler.handle_command(container)
-
-            # Queue response for transmission
+            response, response_data, response_filename = self.mtp_handler.handle_command(container)
             self.pending_response = response
             self.pending_data = response_data
-            self._send_response()
+            self.response_filename = response_filename
+            self._send_response(txn_id)
 
-    def _send_response(self):
+    def _send_response(self, txn_id):
         """Submit a transfer to send response to the host."""
         if (
             self.is_open()
             and not self.xfer_pending(self.ep_in)
             and self.pending_response
         ):
-            # # Send response container first
-            # self.submit_xfer(
-            #     self.ep_in,
-            #     self.pending_response,
-            #     self._send_cb,
-            # )
-
-            # if not self.is_open() or self.xfer_pending(self.ep_in):
-            #     return
-            
             # Priority: data first (if pending), then response
             if self.pending_data is not None:
                 self.submit_xfer(
                     self.ep_in,
                     self.pending_data,  # Raw bytes, NO container
                     self._send_data_cb,
+                )
+            # Send a file if prepared
+            elif self.response_filename is not None:
+                file_size = os.stat(self.response_filename)[6]  # size in bytes
+                data_length = 12 + file_size
+                data_header = struct.pack("<IHHI", data_length, _MTP_CONTAINER_TYPE_DATA, _MTP_OP_GET_OBJECT, txn_id)
+                self.pending_file = open(self.response_filename, 'rb')  # noqa: SIM115
+                bytes_read = self.pending_file.read(_BULK_EP_LEN - 12)  # Max bulk transfer minus header
+                first_bytes = data_header + bytes_read
+                if len(first_bytes) == _BULK_EP_LEN:
+                    cb = self._send_file_cb
+                else:
+                    cb = self._send_file_done_cb
+                self.submit_xfer(
+                    self.ep_in,
+                    first_bytes,
+                    cb,
                 )
             elif self.pending_response is not None:
                 self.submit_xfer(
@@ -428,6 +437,9 @@ class MTPInterface(Interface):
         """Callback when response sent."""
         if res == 0:
             self.pending_response = None
+        else:
+            print(f"Prev xfer failed: res={res}")
+
         self._recv_cmd()  # Resume listening for commands
 
     def _send_data_cb(self, ep, res, num_bytes):
@@ -438,12 +450,9 @@ class MTPInterface(Interface):
             self._recv_cmd()
             return
 
-        while self.xfer_pending(self.ep_in):
-            pass
-
         print(f"Data transfer complete: {num_bytes} bytes")
         self.pending_data = None
-        
+
         # Only now queue the response
         if self.pending_response is not None:
             print("Queueing response container")
@@ -455,6 +464,50 @@ class MTPInterface(Interface):
         else:
             self._recv_cmd()
 
+    def _send_file_cb(self, ep, res, num_bytes):
+        """Reads the next chunk of file and transmits it"""
+        if res != 0:
+            print(f"File xfer failed: res={res}")
+            self.pending_file.close()
+            self.pending_file = None
+            self.response_filename = None
+            self._recv_cmd()
+            return
+
+        print(f"Sent partial file: {num_bytes} bytes")
+        if (
+            self.is_open()
+            and not self.xfer_pending(self.ep_in)
+            and self.pending_file is not None
+        ):
+            next_bytes = self.pending_file.read(_BULK_EP_LEN)
+            if len(next_bytes) == _BULK_EP_LEN:  # If sent everything, there must be more
+                cb = self._send_file_cb
+            else:
+                cb = self._send_file_done_cb
+            self.submit_xfer(
+                self.ep_in,
+                next_bytes,
+                cb,
+            )
+
+    def _send_file_done_cb(self, ep, res, num_bytes):
+        if self.pending_file:
+            self.pending_file.close()
+            self.pending_file = None
+            print(f"Sent remaining file: {num_bytes} bytes")
+            print(f"File transfer  complete: {self.response_filename} bytes")
+            self.response_filename = None
+        if (
+            self.is_open()
+            and not self.xfer_pending(self.ep_in)
+            and self.pending_response is not None
+        ):
+            self.submit_xfer(
+                self.ep_in,
+                self.pending_response,  # Response container header
+                self._send_response_cb,
+            )
 
 class MTPHandler:
     """Implements MTP command logic."""
@@ -502,7 +555,7 @@ class MTPHandler:
             # Unknown operation
             return self._build_response(code, _MTP_RESP_INVALID_OPERATION, txn_id)
 
-    def _build_response(self, code, resp_code, txn_id, params=None, data=None):
+    def _build_response(self, code, resp_code, txn_id, params=None, data: bytes|None=None, filename: str|None=None):
         """Build MTP response container."""
         payload = b""
         if params:
@@ -519,7 +572,7 @@ class MTPHandler:
         else:
             resp_data = None
 
-        return resp_header + payload, resp_data
+        return resp_header + payload, resp_data, filename
 
     def _handle_get_device_info(self, txn_id):
         """Minimal device info response."""
@@ -797,10 +850,7 @@ class MTPHandler:
             return self._build_response(
                 _MTP_OP_GET_OBJECT, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
             )
-        object_bytes = b''
-        with open(object.full_path, 'rb') as obj_f:
-            object_bytes = obj_f.read()
 
         return self._build_response(
-            _MTP_OP_GET_OBJECT, _MTP_RESP_OK, txn_id, data=object_bytes
+            _MTP_OP_GET_OBJECT, _MTP_RESP_OK, txn_id, filename=object.full_path
         )
