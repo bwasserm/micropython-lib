@@ -27,16 +27,19 @@ _MTP_CONTAINER_TYPE_COMMAND = const(1)
 _MTP_CONTAINER_TYPE_DATA = const(2)
 _MTP_CONTAINER_TYPE_RESPONSE = const(3)
 
-# MTP Response codes
+# MTP Response codes Table F.1
 _MTP_RESP_OK = const(0x2001)
 _MTP_RESP_INVALID_OPERATION = const(0x2002)
 _MTP_RESP_PARAMETER_NOT_SUPPORTED = const(0x2006)
 _MTP_RESP_INVALID_STORAGE_ID = const(0x2008)
 _MTP_RESP_INVALID_OBJECT_HANDLE = const(0x2009)
 _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED = const(0x2014)
+_MTP_RESP_NO_VALID_OBJECT_INFO = const(0x2015)
+_MTP_RESP_INVALID_PARENT_OBJECT = const(0x201A)
+_MTP_RESP_INVALID_PARAMETER = const(0x201D)
+_MTP_RESP_INVALID_DATASET = const(0xA806)
 _MTP_RESP_SPECIFICATION_BY_GROUP_NOT_SUPPORTED = const(0xA807)
 _MTP_RESP_SPECIFICATION_BY_DEPTH_UNSUPPORTED = const(0xA808)
-_MTP_RESP_INVALID_PARAMETER = const(0x201D)
 
 # Operation codes
 # Appendix D, Table D.1
@@ -135,7 +138,10 @@ _MTP_DATATYPE_UINT32 = const(0x0006)
 _MTP_DATATYPE_UINT128 = const(0x000A)
 _MTP_DATATYPE_STR = const(0xFFFF)
 
-def _encode_string(string: str):
+_MTP_STRUCT_OBJECT_INFO = "<IHHIHIIIIIIIHII"
+
+
+def _encode_string(string: str) -> bytes:
     # Max len (including null terminator) is 255
     if len(string) > 254:
         string = string[:255]
@@ -146,6 +152,17 @@ def _encode_string(string: str):
     if len(string) > 0:
         encoded += b"\0\0"
     return encoded
+
+
+def _decode_string(data: bytes) -> str:
+    if len(data) < 1:
+        return None
+    strlen = struct.unpack("<B", data)[0]
+    string = ""
+    for c in data[1:(strlen*2):2]:
+        string += c.decode()
+    return string
+
 
 def _encode_array(typecode: str, array: list):
     encoded = struct.pack("<I", len(array))
@@ -165,7 +182,9 @@ class FsObject:
         self.handle: int = handle  # uint32
         self.format_code: int = 0
         self.isdir = isdir
-        self.full_path = self.parent_path + ("/" if self.parent_path != "/" else "") + self.basename
+        self.full_path = (
+            self.parent_path + ("/" if self.parent_path != "/" else "") + self.basename
+        )
         print(self.full_path)
 
         parts = basename.split(".", 1)
@@ -214,6 +233,7 @@ class FsObject:
         else:
             return 0, 0
 
+
 class ObjectHandles:
     def __init__(self):
         # Don't need the key:value lookup of a dict. Not hashable probably, so can't use set.
@@ -231,12 +251,16 @@ class ObjectHandles:
         else:
             parent_handle = self.get_handle(dirname)
         handle = len(self.objects) + 1
-        self.objects.append(FsObject(basename, dirname, parent_handle, size, handle, isdir))
+        self.objects.append(
+            FsObject(basename, dirname, parent_handle, size, handle, isdir)
+        )
 
     def get_children(self, handle: int = 0, path: str = "") -> list[FsObject]:
         children = []
         for obj in self.objects:
-            if (handle and handle == obj.parent_handle) or (path and path == obj.parent_path):
+            if (handle and handle == obj.parent_handle) or (
+                path and path == obj.parent_path
+            ):
                 children.append(obj)
         return children
 
@@ -256,6 +280,7 @@ class ObjectHandles:
         if len(objs) == 1:
             return objs[0].handle
         return None
+
 
 class MTPInterface(Interface):
     """
@@ -288,6 +313,8 @@ class MTPInterface(Interface):
         self.response_filename = None
         self.pending_file = None
 
+        self.pending_rx_object = None
+
     def desc_cfg(self, desc, itf_num, ep_num, strs):
         """
         Add MTP interface descriptor to the configuration.
@@ -301,7 +328,7 @@ class MTPInterface(Interface):
             _MTP_INTERFACE_CLASS,
             _MTP_INTERFACE_SUBCLASS,
             _MTP_INTERFACE_PROTOCOL,
-            iInterface=len(strs)
+            iInterface=len(strs),
         )
 
         # Bulk OUT endpoint (device receives commands from host)
@@ -389,7 +416,9 @@ class MTPInterface(Interface):
 
         # Dispatch to handler
         if self.mtp_handler:
-            response, response_data, response_filename = self.mtp_handler.handle_command(container)
+            response, response_data, response_filename = (
+                self.mtp_handler.handle_command(container)
+            )
             self.pending_response = response
             self.pending_data = response_data
             self.response_filename = response_filename
@@ -413,9 +442,17 @@ class MTPInterface(Interface):
             elif self.response_filename is not None:
                 file_size = os.stat(self.response_filename)[6]  # size in bytes
                 data_length = 12 + file_size
-                data_header = struct.pack("<IHHI", data_length, _MTP_CONTAINER_TYPE_DATA, _MTP_OP_GET_OBJECT, txn_id)
-                self.pending_file = open(self.response_filename, 'rb')  # noqa: SIM115
-                bytes_read = self.pending_file.read(_BULK_EP_LEN - 12)  # Max bulk transfer minus header
+                data_header = struct.pack(
+                    "<IHHI",
+                    data_length,
+                    _MTP_CONTAINER_TYPE_DATA,
+                    _MTP_OP_GET_OBJECT,
+                    txn_id,
+                )
+                self.pending_file = open(self.response_filename, "rb")  # noqa: SIM115
+                bytes_read = self.pending_file.read(
+                    _BULK_EP_LEN - 12
+                )  # Max bulk transfer minus header
                 first_bytes = data_header + bytes_read
                 if len(first_bytes) == _BULK_EP_LEN:
                     cb = self._send_file_cb
@@ -481,7 +518,9 @@ class MTPInterface(Interface):
             and self.pending_file is not None
         ):
             next_bytes = self.pending_file.read(_BULK_EP_LEN)
-            if len(next_bytes) == _BULK_EP_LEN:  # If sent everything, there must be more
+            if (
+                len(next_bytes) == _BULK_EP_LEN
+            ):  # If sent everything, there must be more
                 cb = self._send_file_cb
             else:
                 cb = self._send_file_done_cb
@@ -508,6 +547,7 @@ class MTPInterface(Interface):
                 self.pending_response,  # Response container header
                 self._send_response_cb,
             )
+
 
 class MTPHandler:
     """Implements MTP command logic."""
@@ -546,8 +586,10 @@ class MTPHandler:
             return self._handle_get_object_prop_list(txn_id, payload)
         elif code == _MTP_OP_GET_OBJECT:
             return self._handle_get_object(txn_id, payload)
-        # _MTP_OP_SEND_OBJECT_INFO
-        # _MTP_OP_SEND_OBJECT
+        elif code == _MTP_OP_SEND_OBJECT_INFO:
+            return self._handle_send_object_info(txn_id, payload)
+        elif code == _MTP_OP_SEND_OBJECT:
+            return self._handle_send_object(txn_id, payload)
         # _MTP_OP_RESET_DEVICE
         # _MTP_OP_MOVE_OBJECT
         # _MTP_OP_COPY_OBJECT
@@ -555,19 +597,30 @@ class MTPHandler:
             # Unknown operation
             return self._build_response(code, _MTP_RESP_INVALID_OPERATION, txn_id)
 
-    def _build_response(self, code, resp_code, txn_id, params=None, data: bytes|None=None, filename: str|None=None):
+    def _build_response(
+        self,
+        code,
+        resp_code,
+        txn_id,
+        params=None,
+        data: bytes | None = None,
+        filename: str | None = None,
+    ):
         """Build MTP response container."""
         payload = b""
         if params:
             payload = struct.pack("<" + "I" * len(params), *params)
 
-
         length = 12 + len(payload)
-        resp_header = struct.pack("<IHHI", length, _MTP_CONTAINER_TYPE_RESPONSE, resp_code, txn_id)
+        resp_header = struct.pack(
+            "<IHHI", length, _MTP_CONTAINER_TYPE_RESPONSE, resp_code, txn_id
+        )
 
         if data:
             data_length = 12 + len(data)
-            data_header = struct.pack("<IHHI", data_length, _MTP_CONTAINER_TYPE_DATA, code, txn_id)
+            data_header = struct.pack(
+                "<IHHI", data_length, _MTP_CONTAINER_TYPE_DATA, code, txn_id
+            )
             resp_data = data_header + data
         else:
             resp_data = None
@@ -591,17 +644,17 @@ class MTPHandler:
                 # Appendix D, Table D.1
                 _MTP_OP_GET_DEVICE_INFO,
                 _MTP_OP_OPEN_SESSION,
-                # _MTP_OP_CLOSE_SESSION,
+                _MTP_OP_CLOSE_SESSION,
                 _MTP_OP_GET_STORAGE_IDS,
                 _MTP_OP_GET_STORAGE_INFO,
                 # _MTP_OP_GET_NUM_OBJECTS,
                 _MTP_OP_GET_OBJECT_HANDLES,
                 _MTP_OP_GET_OBJECT_INFO,
-                # _MTP_OP_GET_OBJECT,
+                _MTP_OP_GET_OBJECT,
                 # _MTP_OP_DELETE_OBJECT,
                 # _MTP_OP_GET_OBJECT_PROP_DESC,
-                # _MTP_OP_SEND_OBJECT_INFO,
-                # _MTP_OP_SEND_OBJECT,
+                _MTP_OP_SEND_OBJECT_INFO,
+                _MTP_OP_SEND_OBJECT,
                 # _MTP_OP_RESET_DEVICE,
                 # _MTP_OP_GET_DEVICE_PROP_DESC,
                 # _MTP_OP_GET_DEVICE_PROP_VALUE,
@@ -610,7 +663,7 @@ class MTPHandler:
                 # _MTP_OP_COPY_OBJECT,
                 # _MTP_OP_GET_OBJECT_PROP_VALUE,
                 # _MTP_OP_SET_OBJECT_PROP_VALUE,
-                _MTP_OP_GET_OBJECT_PROP_LIST
+                _MTP_OP_GET_OBJECT_PROP_LIST,
             ],
         )
         events_supported = _encode_array(
@@ -620,14 +673,9 @@ class MTPHandler:
                 _MTP_EVENT_OBJECT_REMOVED,
             ],
         )
-        device_properties_supported = _encode_array(
-            "H", [_MTP_DEVICE_PROP_UNDEFINED]
-        )
+        device_properties_supported = _encode_array("H", [_MTP_DEVICE_PROP_UNDEFINED])
         capture_formats = _encode_array("H", [])
-        playback_formats = _encode_array(
-            "H",
-            _MTP_SUPPORTED_OBJECT_FORMATS
-        )
+        playback_formats = _encode_array("H", _MTP_SUPPORTED_OBJECT_FORMATS)
         manufacturer = _encode_string("")
         model = _encode_string("")
         device_version = _encode_string("")
@@ -686,12 +734,14 @@ class MTPHandler:
         storage_type = struct.pack("<H", 0x0003)  # Fixed RAM
         filesystem_type = struct.pack("<H", 0x0002)  # Generic hierarchical
         access_capability = struct.pack("<H", 0x0000)  # Read-write
-        bsize, frsize, blocks, bfree, _, _, _, _, _, _ = os.statvfs('/')
+        bsize, frsize, blocks, bfree, _, _, _, _, _, _ = os.statvfs("/")
         max_capacity = struct.pack("<Q", frsize * blocks)
         free_space = struct.pack("<Q", bfree * bsize)
         free_objects = struct.pack("<Q", 0xFFFFFFFF)  # Unused field
         storage_description = _encode_string("Micropython")
-        volume_identifier = _encode_string(''.join([hex(b)[2:4] for b in machine.unique_id()]))
+        volume_identifier = _encode_string(
+            "".join([hex(b)[2:4] for b in machine.unique_id()])
+        )
 
         storage_info = (
             storage_type
@@ -713,9 +763,13 @@ class MTPHandler:
         # D.2.7 GetObjectHandles
 
         if len(payload) >= 12:
-            storage_id, object_format_code, parent_id = struct.unpack("<III", payload[0:12])
+            storage_id, object_format_code, parent_id = struct.unpack(
+                "<III", payload[0:12]
+            )
         else:
-            return self._build_response(_MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_INVALID_PARAMETER, txn_id)
+            return self._build_response(
+                _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_INVALID_PARAMETER, txn_id
+            )
 
         if storage_id != STORAGE_ID:
             self._build_response(
@@ -725,7 +779,9 @@ class MTPHandler:
             # Don't support filtering by format code
             # TODO eventually support this?
             return self._build_response(
-                _MTP_OP_GET_OBJECT_HANDLES, _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED, txn_id
+                _MTP_OP_GET_OBJECT_HANDLES,
+                _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED,
+                txn_id,
             )
         self._scan_fs("/")
         if parent_id != 0xFFFFFFFF and self.object_handles.get(parent_id) is None:
@@ -760,26 +816,29 @@ class MTPHandler:
             )
 
         # 5.3.1 ObjectInfo Dataset Description
-        object_info = struct.pack("<IHHIHIIIIIIIHII",
+        object_info = struct.pack(
+            _MTP_STRUCT_OBJECT_INFO,
             STORAGE_ID,
-            object.format_code, # ObjectFormatCode
-            0x0000, # Protection Status - Unprotected
-            object.size, # Compressed Size
-            0x0000, # Thumb Format
-            0x00000000, # Thumb Compressed Size
-            0x00000000, # Thumb Pix Width
-            0x00000000, # Thumb Pix Height
-            0x00000000, # Image Pix Width
-            0x00000000, # Image Pix Height
-            0x00000000, # Image Bit Depth
+            object.format_code,  # ObjectFormatCode
+            0x0000,  # Protection Status - Unprotected
+            object.size,  # Compressed Size
+            0x0000,  # Thumb Format
+            0x00000000,  # Thumb Compressed Size
+            0x00000000,  # Thumb Pix Width
+            0x00000000,  # Thumb Pix Height
+            0x00000000,  # Image Pix Width
+            0x00000000,  # Image Pix Height
+            0x00000000,  # Image Bit Depth
             object.parent_handle,  # Parent Object
             0x0001 if object.isdir else 0x0000,  # Association Type
             0x00000000,  # Association Description
-            0x0000000  # Sequence Number
-        ) + (_encode_string(object.basename)  # Filename
-        + _encode_string("")  # Date Created
-        + _encode_string("")  # Date Modified
-        + _encode_string(""))  # Keywords
+            0x0000000,  # Sequence Number
+        ) + (
+            _encode_string(object.basename)  # Filename
+            + _encode_string("")  # Date Created
+            + _encode_string("")  # Date Modified
+            + _encode_string("")
+        )  # Keywords
 
         return self._build_response(
             _MTP_OP_GET_OBJECT_INFO, _MTP_RESP_OK, txn_id, data=object_info
@@ -790,8 +849,10 @@ class MTPHandler:
         if len(payload) < 20:  # 5 uint32's
             return self._build_response(
                 _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
-            ) 
-        object_handle, object_format_code, object_prop_code, _, depth = struct.unpack("<IIIII", payload[:20])
+            )
+        object_handle, object_format_code, object_prop_code, _, depth = struct.unpack(
+            "<IIIII", payload[:20]
+        )
         if object_handle == 0xFFFFFFFF:  # All objects
             objects = self.object_handles.objects
         elif object_handle == 0x00000000:  # Objects in /
@@ -800,17 +861,25 @@ class MTPHandler:
             objects = [self.object_handles.get(object_handle)]
             if objects[0] is None:
                 return self._build_response(
-                    _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+                    _MTP_OP_GET_OBJECT_PROP_LIST,
+                    _MTP_RESP_INVALID_OBJECT_HANDLE,
+                    txn_id,
                 )
         if object_format_code != 0x00000000:
             return self._build_response(
-                _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED, txn_id
+                _MTP_OP_GET_OBJECT_PROP_LIST,
+                _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED,
+                txn_id,
             )
         if object_prop_code == 0xFFFFFFFF:
             prop_codes_requested = _MTP_SUPPORTED_OBJECT_PROPERTIES
-        elif object_prop_code == 0x00000000:  # Get group code from 4th param not supported
+        elif (
+            object_prop_code == 0x00000000
+        ):  # Get group code from 4th param not supported
             return self._build_response(
-                _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_SPECIFICATION_BY_GROUP_NOT_SUPPORTED, txn_id
+                _MTP_OP_GET_OBJECT_PROP_LIST,
+                _MTP_RESP_SPECIFICATION_BY_GROUP_NOT_SUPPORTED,
+                txn_id,
             )
         else:
             prop_codes_requested = [object_prop_code]
@@ -820,7 +889,9 @@ class MTPHandler:
             objects = self.object_handles.get_children_handles(object_handle)
         elif depth > 1:
             return self._build_response(
-                _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_SPECIFICATION_BY_DEPTH_UNSUPPORTED, txn_id
+                _MTP_OP_GET_OBJECT_PROP_LIST,
+                _MTP_RESP_SPECIFICATION_BY_DEPTH_UNSUPPORTED,
+                txn_id,
             )
         # else depth = 0, so objects = [object_handle], set above
 
@@ -834,7 +905,10 @@ class MTPHandler:
             object_prop_list_bytes += struct.pack("<IHH", prop[0], prop[1], prop[2])
             object_prop_list_bytes += prop[3]
         return self._build_response(
-            _MTP_OP_GET_OBJECT_PROP_LIST, _MTP_RESP_OK, txn_id, data=object_prop_list_bytes
+            _MTP_OP_GET_OBJECT_PROP_LIST,
+            _MTP_RESP_OK,
+            txn_id,
+            data=object_prop_list_bytes,
         )
 
     def _handle_get_object(self, txn_id, payload):
@@ -854,3 +928,76 @@ class MTPHandler:
         return self._build_response(
             _MTP_OP_GET_OBJECT, _MTP_RESP_OK, txn_id, filename=object.full_path
         )
+
+    def _handle_send_object_info(self, txn_id, payload):
+        # D.2.12
+        if len(payload) < 4 or struct.unpack("<I", payload[:4])[0] not in (0x00000000, STORAGE_ID):
+            return self._build_response(
+                _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_STORAGE_ID, txn_id
+            )
+        if len(payload) < 8:
+            return self._build_response(
+                _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+            )
+        parent_object_handle = struct.unpack("<I", payload[4:8])[0]
+        if parent_object_handle == 0xFFFFFFFF:
+            parent_path = "/"
+        else:
+            parent_object = self.object_handles.get(parent_object_handle)
+            if parent_object is None:
+                return self._build_response(
+                    _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+                )
+            if not parent_object.isdir:
+                return self._build_response(
+                    _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_PARENT_OBJECT, txn_id
+                )
+            parent_path = parent_object.full_path
+        # Parse ObjectInfo dataset 5.3.1
+        print(f"ObjectInfo payload len {len(payload)} bytes")
+        if len(payload) < (struct.calcsize(_MTP_STRUCT_OBJECT_INFO) + 8 + 4):  # 2 Params, ObjectInfo, Name len
+            return self._build_response(
+                _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_DATASET, txn_id
+            )
+        (
+            storage_id,
+            object_format_code,
+            _,  # Thumb format
+            object_compressed_size,
+            _,  # Thumb format
+            _,  # Thumb compressed size
+            _,  # Thumb pix width
+            _,  # Thumb pix height
+            parent_object_handle2,
+            association_type,
+            _,  # Association Description
+            _  # Sequence number
+        ) = struct.unpack(_MTP_STRUCT_OBJECT_INFO, payload[8:8 + _MTP_STRUCT_OBJECT_INFO])
+        if storage_id not in (0x00000000, STORAGE_ID):
+            return self._build_response(
+                _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_STORAGE_ID, txn_id
+            )
+        if parent_object_handle2 not in (0x00000000, parent_object_handle):
+            return self._build_response(
+                _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_PARENT_OBJECT, txn_id
+            )
+        filename = _decode_string(payload[8 + _MTP_STRUCT_OBJECT_INFO:])
+        full_path = parent_path + filename
+        print(f"About to receive {full_path}")
+        print(f"New format code {object_format_code}")
+        if self.object_handles.get_handle(full_path) is None:
+            self.object_handles.add(parent_path, filename, object_compressed_size, bool(association_type))
+        self.pending_rx_object_handle = self.object_handles.get_handle(full_path)
+        return self._build_response(_MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_OK, txn_id)
+
+
+    def _handle_send_object(self, txn_id, payload):
+        # D.2.13
+        if not self.pending_rx_object_handle:
+            return self._build_response(_MTP_OP_SEND_OBJECT, _MTP_RESP_NO_VALID_OBJECT_INFO, txn_id)
+        object = self.object_handles.get(self.pending_rx_object_handle)
+        path = object.full_path
+        with open(path, "wb") as f:
+            f.write(payload)
+        self.pending_rx_object_handle = None
+        return self._build_response(_MTP_OP_SEND_OBJECT, _MTP_RESP_OK, txn_id)
