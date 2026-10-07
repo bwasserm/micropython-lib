@@ -159,8 +159,10 @@ def _decode_string(data: bytes) -> str:
         return None
     strlen = struct.unpack("<B", data)[0]
     string = ""
-    for c in data[1:(strlen*2):2]:
-        string += c.decode()
+    i = 1
+    while i < (strlen * 2):
+        string += chr(data[i])
+        i += 2  # Every other character is 0. Really it's a 16-bit encoding but I don't know what. Hope it's ASCII/UTF-8.
     return string
 
 
@@ -400,6 +402,14 @@ class MTPInterface(Interface):
         Args:
             data: Raw bytes from bulk endpoint
         """
+        if self.mtp_handler.next_out_handler:
+            response = self.mtp_handler.next_out_handler(data)
+            if response:
+                self.pending_response = response[0]
+                self.pending_data = response[1]
+                self.response_filename = response[2]
+                self._send_response(response[3])
+                return
         if len(data) < 12:
             return  # Invalid container header
 
@@ -555,6 +565,13 @@ class MTPHandler:
     def __init__(self):
         self.session_id = None
         self.object_handles = ObjectHandles()
+        self._next_command_is_data = False
+        self._incoming_object = None
+
+        # Some messages need to be processed in their entirety, or even partially
+        # without the usual parsing of the header for commands. If this is not-None,
+        # then the interface should call this with the entire message
+        self.next_out_handler: callable[bytes] = None
 
     def handle_command(self, container):
         """
@@ -587,7 +604,10 @@ class MTPHandler:
         elif code == _MTP_OP_GET_OBJECT:
             return self._handle_get_object(txn_id, payload)
         elif code == _MTP_OP_SEND_OBJECT_INFO:
-            return self._handle_send_object_info(txn_id, payload)
+            if not self._next_command_is_data:
+                return self._handle_send_object_info(txn_id, payload)
+            if not self._incoming_object:
+                return self._handle_send_object_info_data(txn_id, payload)
         elif code == _MTP_OP_SEND_OBJECT:
             return self._handle_send_object(txn_id, payload)
         # _MTP_OP_RESET_DEVICE
@@ -931,7 +951,10 @@ class MTPHandler:
 
     def _handle_send_object_info(self, txn_id, payload):
         # D.2.12
-        if len(payload) < 4 or struct.unpack("<I", payload[:4])[0] not in (0x00000000, STORAGE_ID):
+        if len(payload) < 4 or struct.unpack("<I", payload[:4])[0] not in (
+            0x00000000,
+            STORAGE_ID,
+        ):
             return self._build_response(
                 _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_STORAGE_ID, txn_id
             )
@@ -953,51 +976,91 @@ class MTPHandler:
                     _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_PARENT_OBJECT, txn_id
                 )
             parent_path = parent_object.full_path
+        print(f"CMD to receive in path {parent_path}")
+        self._next_command_is_data = True
+        return None, None, None  # No response from this, data is coming next
+
+    def _handle_send_object_info_data(self, txn_id, payload):
+        self._next_command_is_data = False
         # Parse ObjectInfo dataset 5.3.1
         print(f"ObjectInfo payload len {len(payload)} bytes")
-        if len(payload) < (struct.calcsize(_MTP_STRUCT_OBJECT_INFO) + 8 + 4):  # 2 Params, ObjectInfo, Name len
+        if len(payload) < (struct.calcsize(_MTP_STRUCT_OBJECT_INFO)):  # ObjectInfo
             return self._build_response(
                 _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_DATASET, txn_id
             )
         (
             storage_id,
             object_format_code,
-            _,  # Thumb format
+            _,  # Protection Status
             object_compressed_size,
             _,  # Thumb format
             _,  # Thumb compressed size
             _,  # Thumb pix width
             _,  # Thumb pix height
-            parent_object_handle2,
+            _,  # Image pix width
+            _,  # Image pix height
+            _,  # Image bit depth
+            parent_object_handle,
             association_type,
             _,  # Association Description
-            _  # Sequence number
-        ) = struct.unpack(_MTP_STRUCT_OBJECT_INFO, payload[8:8 + _MTP_STRUCT_OBJECT_INFO])
+            _,  # Sequence number
+        ) = struct.unpack(
+            _MTP_STRUCT_OBJECT_INFO, payload[:struct.calcsize(_MTP_STRUCT_OBJECT_INFO)]
+        )
         if storage_id not in (0x00000000, STORAGE_ID):
             return self._build_response(
                 _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_STORAGE_ID, txn_id
             )
-        if parent_object_handle2 not in (0x00000000, parent_object_handle):
-            return self._build_response(
-                _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_PARENT_OBJECT, txn_id
-            )
-        filename = _decode_string(payload[8 + _MTP_STRUCT_OBJECT_INFO:])
-        full_path = parent_path + filename
-        print(f"About to receive {full_path}")
-        print(f"New format code {object_format_code}")
-        if self.object_handles.get_handle(full_path) is None:
-            self.object_handles.add(parent_path, filename, object_compressed_size, bool(association_type))
-        self.pending_rx_object_handle = self.object_handles.get_handle(full_path)
-        return self._build_response(_MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_OK, txn_id)
+        if parent_object_handle == 0xFFFFFFFF:
+            parent_path = "/"
+        else:
+            parent_object = self.object_handles.get(parent_object_handle)
+            if parent_object is None:
+                return self._build_response(
+                    _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+                )
+            if not parent_object.isdir:
+                return self._build_response(
+                    _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_PARENT_OBJECT, txn_id
+                )
+            parent_path = parent_object.full_path
+        print(f"New format code {object_format_code:x}")
+        self._incoming_object = {
+            "parent_path": parent_path,
+            "size": object_compressed_size,
+            "isdir": bool(association_type),
+            "txn_id": txn_id,
+        }
+        self.next_out_handler = self._handle_send_object_info_filename
+        return None, None, None  # No reply, next is filename
 
+    def _handle_send_object_info_filename(self, payload):
+        filename = _decode_string(payload)
+        full_path = self._incoming_object["parent_path"] + ("/" if self._incoming_object["parent_path"] != "/" else "") + filename
+        self._incoming_object["full_path"] = full_path
+        print(f"About to receive {full_path}")
+        if self.object_handles.get_handle(full_path) is None:
+            self.object_handles.add(
+                self._incoming_object["parent_path"],
+                filename,
+                self._incoming_object["size"],
+                self._incoming_object["isdir"],
+            )
+        self.next_out_handler = None
+        resp, resp_data, resp_fn = self._build_response(_MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_OK, self._incoming_object["txn_id"])
+        return resp, resp_data, resp_fn, self._incoming_object["txn_id"]
 
     def _handle_send_object(self, txn_id, payload):
         # D.2.13
-        if not self.pending_rx_object_handle:
-            return self._build_response(_MTP_OP_SEND_OBJECT, _MTP_RESP_NO_VALID_OBJECT_INFO, txn_id)
-        object = self.object_handles.get(self.pending_rx_object_handle)
-        path = object.full_path
-        with open(path, "wb") as f:
-            f.write(payload)
+        if not self._incoming_object or not self._incoming_object["full_path"]:
+            return self._build_response(
+                _MTP_OP_SEND_OBJECT, _MTP_RESP_NO_VALID_OBJECT_INFO, txn_id
+            )
+        path = self._incoming_object["full_path"]
+        if self._incoming_object["isdir"]:
+            os.mkdir(path)
+        else:
+            with open(path, "wb") as f:
+                f.write(payload)
         self.pending_rx_object_handle = None
         return self._build_response(_MTP_OP_SEND_OBJECT, _MTP_RESP_OK, txn_id)
