@@ -55,7 +55,7 @@ _MTP_OP_GET_OBJECT = 0x1009
 _MTP_OP_DELETE_OBJECT = 0x100B
 _MTP_OP_SEND_OBJECT_INFO = 0x100C
 _MTP_OP_SEND_OBJECT = 0x100D
-_MTP_OP_RESET_DEVICE = 0x1010
+# _MTP_OP_RESET_DEVICE = 0x1010
 _MTP_OP_GET_DEVICE_PROP_DESC = 0x1014
 _MTP_OP_GET_DEVICE_PROP_VALUE = 0x1015
 _MTP_OP_SET_DEVICE_PROP_VALUE = 0x1016
@@ -158,9 +158,11 @@ def _decode_string(data: bytes) -> str:
     if len(data) < 1:
         return None
     strlen = struct.unpack("<B", data)[0]
+    if strlen == 0:
+        return ""
     string = ""
     i = 1
-    while i < (strlen * 2):
+    while i < ((strlen - 1) * 2):  # Last character is a null
         string += chr(data[i])
         i += 2  # Every other character is 0. Really it's a 16-bit encoding but I don't know what. Hope it's ASCII/UTF-8.
     return string
@@ -175,7 +177,7 @@ def _encode_array(typecode: str, array: list):
 
 
 class FsObject:
-    def __init__(self, basename, parent_path, parent_handle, size, handle, isdir):
+    def __init__(self, basename, parent_path, parent_handle, size, handle, isdir, format_code=None):
         print(basename, parent_path, parent_handle, size, handle, isdir)
         self.basename: str = basename
         self.parent_path: str = parent_path
@@ -190,7 +192,9 @@ class FsObject:
         print(self.full_path)
 
         parts = basename.split(".", 1)
-        if isdir:
+        if format_code:
+            self.format_code = format_code
+        elif isdir:
             self.format_code = _MTP_OBJECT_FORMAT_ASSOCIATION
         elif len(parts) == 1:
             self.format_code = _MTP_OBJECT_FORMAT_UNIDENTIFIED
@@ -244,7 +248,7 @@ class ObjectHandles:
     def reset(self):
         del self.objects[:-1]
 
-    def add(self, dirname: str, basename: str, size: int, isdir: bool):
+    def add(self, dirname: str, basename: str, size: int, isdir: bool, format_code: int|None = None):
         full_path = dirname + ("/" if dirname != "/" else "") + basename
         if any(full_path == o.full_path for o in self.objects):
             return
@@ -254,8 +258,17 @@ class ObjectHandles:
             parent_handle = self.get_handle(dirname)
         handle = len(self.objects) + 1
         self.objects.append(
-            FsObject(basename, dirname, parent_handle, size, handle, isdir)
+            FsObject(basename, dirname, parent_handle, size, handle, isdir, format_code)
         )
+
+    def delete(self, handle: int):
+        obj_index = -1
+        for i, obj in enumerate(self.objects):
+            if obj.handle == handle:
+                obj_index = i
+                break
+        if obj_index > -1:
+            del self.objects[obj_index]
 
     def get_children(self, handle: int = 0, path: str = "") -> list[FsObject]:
         children = []
@@ -566,12 +579,15 @@ class MTPHandler:
         self.session_id = None
         self.object_handles = ObjectHandles()
         self._next_command_is_data = False
-        self._incoming_object = None
 
         # Some messages need to be processed in their entirety, or even partially
         # without the usual parsing of the header for commands. If this is not-None,
-        # then the interface should call this with the entire message
+        # then the interface should call this with the entire message.
         self.next_out_handler: callable[bytes] = None
+        # Any state that needs to be kept temporarily for the next next_out_handler call
+        # should be stored in _next_out_state. Also for upcoming commands that are
+        # expected in a direct sequence, like SendObjectInfo -> SendObject.
+        self._next_out_state = None
 
     def handle_command(self, container):
         """
@@ -606,13 +622,14 @@ class MTPHandler:
         elif code == _MTP_OP_SEND_OBJECT_INFO:
             if not self._next_command_is_data:
                 return self._handle_send_object_info(txn_id, payload)
-            if not self._incoming_object:
-                return self._handle_send_object_info_data(txn_id, payload)
+            return self._handle_send_object_info_data(txn_id, payload)
         elif code == _MTP_OP_SEND_OBJECT:
             return self._handle_send_object(txn_id, payload)
-        # _MTP_OP_RESET_DEVICE
-        # _MTP_OP_MOVE_OBJECT
+        elif code == _MTP_OP_MOVE_OBJECT:
+            return self._handle_move_object(txn_id, payload)
         # _MTP_OP_COPY_OBJECT
+        elif code == _MTP_OP_DELETE_OBJECT:
+            return self._handle_delete_object(txn_id, payload)
         else:
             # Unknown operation
             return self._build_response(code, _MTP_RESP_INVALID_OPERATION, txn_id)
@@ -671,7 +688,7 @@ class MTPHandler:
                 _MTP_OP_GET_OBJECT_HANDLES,
                 _MTP_OP_GET_OBJECT_INFO,
                 _MTP_OP_GET_OBJECT,
-                # _MTP_OP_DELETE_OBJECT,
+                _MTP_OP_DELETE_OBJECT,
                 # _MTP_OP_GET_OBJECT_PROP_DESC,
                 _MTP_OP_SEND_OBJECT_INFO,
                 _MTP_OP_SEND_OBJECT,
@@ -949,6 +966,58 @@ class MTPHandler:
             _MTP_OP_GET_OBJECT, _MTP_RESP_OK, txn_id, filename=object.full_path
         )
 
+    def _handle_delete_object(self, txn_id, payload):
+        if len(payload) >= 4:
+            object_handle = struct.unpack("<I", payload[:4])[0]
+        object = self.object_handles.get(object_handle)
+        if object is None:
+            return self._build_response(
+                _MTP_OP_DELETE_OBJECT, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+            )
+        if len(payload) >= 8:
+            format_code = struct.unpack("<I", payload[4:8])[0]
+        if format_code != 0x00000000:
+            return self._build_response(
+                _MTP_OP_DELETE_OBJECT, _MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED, txn_id
+            )
+        path = object.full_path
+        os.remove(path)
+        self.object_handles.delete(object_handle)
+        return self._build_response(
+            _MTP_OP_DELETE_OBJECT, _MTP_RESP_OK, txn_id
+        )
+
+    def _handle_move_object(self, txn_id, payload):
+        if len(payload) >= 12:
+            object_handle, storage_id, new_parent_handle = struct.unpack("<III", payload[:12])
+        object = self.object_handles.get(object_handle)
+        if object is None:
+            return self._build_response(
+                _MTP_OP_MOVE_OBJECT, _MTP_RESP_INVALID_OBJECT_HANDLE, txn_id
+            )
+        if storage_id != STORAGE_ID:
+            return self._build_response(
+                _MTP_OP_MOVE_OBJECT, _MTP_RESP_INVALID_STORAGE_ID, txn_id
+            )
+        if new_parent_handle == 0xFFFFFFFF:
+            parent_path = "/"
+            new_path = "/" + object.basename
+        else:
+            parent = self.object_handles.get(new_parent_handle)
+            if parent is None:
+                return self._build_response(
+                    _MTP_OP_MOVE_OBJECT, _MTP_RESP_INVALID_PARENT_OBJECT, txn_id
+                )
+            parent_path = parent.full_path
+            new_path = parent_path + "/" + object.basename
+        os.rename(object.full_path, new_path)
+        object.parent_path = parent_path
+        object.parent_handle = new_parent_handle
+        object.full_path = new_path
+        return self._build_response(
+            _MTP_OP_MOVE_OBJECT, _MTP_RESP_OK, txn_id
+        )
+
     def _handle_send_object_info(self, txn_id, payload):
         # D.2.12
         if len(payload) < 4 or struct.unpack("<I", payload[:4])[0] not in (
@@ -1024,9 +1093,9 @@ class MTPHandler:
                     _MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_INVALID_PARENT_OBJECT, txn_id
                 )
             parent_path = parent_object.full_path
-        print(f"New format code {object_format_code:x}")
-        self._incoming_object = {
+        self._next_out_state = {
             "parent_path": parent_path,
+            "format_code": object_format_code,
             "size": object_compressed_size,
             "isdir": bool(association_type),
             "txn_id": txn_id,
@@ -1036,31 +1105,54 @@ class MTPHandler:
 
     def _handle_send_object_info_filename(self, payload):
         filename = _decode_string(payload)
-        full_path = self._incoming_object["parent_path"] + ("/" if self._incoming_object["parent_path"] != "/" else "") + filename
-        self._incoming_object["full_path"] = full_path
+        full_path = self._next_out_state["parent_path"] + ("/" if self._next_out_state["parent_path"] != "/" else "") + filename
+        self._next_out_state["full_path"] = full_path
         print(f"About to receive {full_path}")
         if self.object_handles.get_handle(full_path) is None:
             self.object_handles.add(
-                self._incoming_object["parent_path"],
+                self._next_out_state["parent_path"],
                 filename,
-                self._incoming_object["size"],
-                self._incoming_object["isdir"],
+                self._next_out_state["size"],
+                self._next_out_state["isdir"],
+                self._next_out_state["format_code"],
             )
         self.next_out_handler = None
-        resp, resp_data, resp_fn = self._build_response(_MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_OK, self._incoming_object["txn_id"])
-        return resp, resp_data, resp_fn, self._incoming_object["txn_id"]
+        txn_id = self._next_out_state["txn_id"]
+        resp, resp_data, resp_fn = self._build_response(_MTP_OP_SEND_OBJECT_INFO, _MTP_RESP_OK, txn_id)
+        return resp, resp_data, resp_fn, txn_id
 
     def _handle_send_object(self, txn_id, payload):
         # D.2.13
-        if not self._incoming_object or not self._incoming_object["full_path"]:
+        if not self._next_out_state or not self._next_out_state["full_path"]:
             return self._build_response(
                 _MTP_OP_SEND_OBJECT, _MTP_RESP_NO_VALID_OBJECT_INFO, txn_id
             )
-        path = self._incoming_object["full_path"]
-        if self._incoming_object["isdir"]:
+        path = self._next_out_state["full_path"]
+        if self._next_out_state["isdir"]:
             os.mkdir(path)
+            bytes_written = 0
         else:
             with open(path, "wb") as f:
-                f.write(payload)
-        self.pending_rx_object_handle = None
-        return self._build_response(_MTP_OP_SEND_OBJECT, _MTP_RESP_OK, txn_id)
+                bytes_written = f.write(payload)
+        if self._next_out_state["isdir"] or bytes_written == self._next_out_state["size"]:
+            # Created directory or wrote file
+            self._next_out_state = None
+            return self._build_response(_MTP_OP_SEND_OBJECT, _MTP_RESP_OK, txn_id)
+        # else still more file to go
+        self._next_out_state["txn_id"] = txn_id
+        self._next_out_state["bytes_written"] = bytes_written
+        self.next_out_handler = self._handle_send_object_data
+        return None, None, None
+
+    def _handle_send_object_data(self, data):
+        with open(self._next_out_state["full_path"], "ab") as f:
+            bytes_written = f.write(data)
+        self._next_out_state["bytes_written"] += bytes_written
+        if self._next_out_state["bytes_written"] < self._next_out_state["size"]:
+            return None  # Keep reading
+        # Done reading, prepare response and clean up callback
+        txn_id = self._next_out_state["txn_id"]
+        self._next_out_state = None
+        self.next_out_handler = None
+        resp, resp_data, resp_fn = self._build_response(_MTP_OP_SEND_OBJECT, _MTP_RESP_OK, txn_id)
+        return resp, resp_data, resp_fn, txn_id
