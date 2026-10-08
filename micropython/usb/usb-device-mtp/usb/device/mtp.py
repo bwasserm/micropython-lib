@@ -696,7 +696,7 @@ class MTPHandler:
                 # _MTP_OP_GET_DEVICE_PROP_DESC,
                 # _MTP_OP_GET_DEVICE_PROP_VALUE,
                 # _MTP_OP_SET_DEVICE_PROP_VALUE,
-                # _MTP_OP_MOVE_OBJECT,
+                _MTP_OP_MOVE_OBJECT,
                 # _MTP_OP_COPY_OBJECT,
                 # _MTP_OP_GET_OBJECT_PROP_VALUE,
                 # _MTP_OP_SET_OBJECT_PROP_VALUE,
